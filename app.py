@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-# SciPy is needed for clustering; we'll fail gracefully if missing.
+# SciPy for clustering (optional but recommended)
 try:
     from scipy.cluster.hierarchy import linkage, leaves_list
     SCIPY_OK = True
@@ -16,7 +16,7 @@ uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
 
 # ======================================================
-# Helpers
+# Data prep helpers
 # ======================================================
 def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df = df_long.copy()
@@ -32,7 +32,7 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
             return "Partial"
         if x == "":
             return "Blank"
-        return x  # keep unexpected text
+        return x
 
     def norm_goal(x):
         x = "" if pd.isna(x) else str(x).strip()
@@ -45,14 +45,11 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df["Compliance_status"] = df["Compliance_raw"].apply(norm_compliance)
     df["Goal_status"] = df["Goal_raw"].apply(norm_goal)
 
-    # Parse dd.mm.yyyy dates if present
     df["Goal_date"] = pd.to_datetime(df["Goal_raw"], format="%d.%m.%Y", errors="coerce")
 
-    # Score for charts
     score_map = {"Compliant": 1.0, "Partial": 0.5}
     df["Score"] = df["Compliance_status"].map(score_map).fillna(0.0)
 
-    # Convenience flags
     df["Is_open_item"] = df["Compliance_status"].isin(["Partial", "Not compliant"])
     df["Has_goal_date"] = df["Goal_date"].notna()
     df["Has_missing_goal"] = df["Goal_status"].eq("Missing")
@@ -63,12 +60,11 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
 def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
     """
     Reads Excel where:
-    - Row 1 has Department labels repeated: A A B B C C ...
-    - Row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
+    - Header row 1 has Department labels repeated: A A B B C C ...
+    - Header row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
     """
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
 
-    # Forward-fill department names (merged cells often create blanks)
     tuples = []
     last_dept = None
     for dept, field in df.columns:
@@ -87,10 +83,6 @@ def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
 
 
 def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Convert 2-header wide format into long format AND return criteria order as in the sheet.
-    Output columns: Department, Criteria, Compliance_raw, Goal_raw
-    """
     criteria_col = None
     for col in df.columns:
         if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
@@ -109,8 +101,7 @@ def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     )
 
     rest = df.drop(columns=[criteria_col])
-    stacked = rest.stack(level=0).reset_index()
-    stacked = stacked.rename(columns={"level_1": "Department"})
+    stacked = rest.stack(level=0).reset_index().rename(columns={"level_1": "Department"})
 
     lower_map = {c: str(c).lower() for c in stacked.columns}
     compliance_col = next((c for c, v in lower_map.items() if "compliant" in v), None)
@@ -165,66 +156,71 @@ def dept_leaderboard(df_in: pd.DataFrame, today: pd.Timestamp, d30: pd.Timestamp
 
     out["Avg_days_to_goal_open"] = out["Department"].apply(avg_days_open).round(1)
 
-    out = out.sort_values(["Overdue", "Compliance_pct"], ascending=[False, True])
-    return out
+    return out.sort_values(["Overdue", "Compliance_pct"], ascending=[False, True])
 
 
+# ======================================================
+# Visualization helper (FIXED widget keys)
+# ======================================================
 def draw_heatmap_with_controls(
     data: pd.DataFrame,
     title: str,
     criteria_order: list[str],
+    key_prefix: str,
     show_chunking: bool = True,
     default_chunk: int = 12,
 ):
     """
-    Draw a wide heatmap with:
+    Heatmap with:
     - zoom slider (px per column)
-    - optional chunking/paging across criteria
-    - larger height, rotated ticks, reduced margins
-    - option to force criteria order
+    - optional chunking across criteria
+    - bigger height, rotated labels
+    - ALL widgets have unique keys via key_prefix (fixes duplicate ID errors)
     """
     if data.empty:
         st.info("No data to display (check filters).")
         return
 
-    # Ensure criteria order (only for columns that exist)
-    cols = [c for c in criteria_order if c in data.columns]
-    other_cols = [c for c in data.columns if c not in cols]
-    data = data[cols + other_cols]
+    # enforce criteria order for columns that exist
+    crit_cols = [c for c in criteria_order if c in data.columns]
+    other_cols = [c for c in data.columns if c not in crit_cols]
+    data = data[crit_cols + other_cols]
 
-    n_rows = data.shape[0]
-    n_cols = data.shape[1]
-
-    if show_chunking and len(cols) > default_chunk:
-        st.caption("Tip: Use chunking if there are many criteria to make the heatmap easier to read.")
-        chunk = st.select_slider("Criteria chunk size", options=[9, 12, 15, 18, 24], value=default_chunk)
+    # Optional chunking (only across criteria columns, not extra columns)
+    view = data
+    if show_chunking and len(crit_cols) > default_chunk:
+        chunk = st.select_slider(
+            "Criteria chunk size",
+            options=[9, 12, 15, 18, 24],
+            value=default_chunk,
+            key=f"{key_prefix}_chunk"
+        )
         start = st.number_input(
             "Start criterion (0-based)",
             min_value=0,
-            max_value=max(0, len(cols) - 1),
+            max_value=max(0, len(crit_cols) - 1),
             value=0,
-            step=chunk
+            step=int(chunk),
+            key=f"{key_prefix}_start"
         )
-        cols_view = cols[int(start):int(start) + int(chunk)]
-        # Keep any extra columns (like Dept Avg) at the end
-        keep_extra = [c for c in other_cols if c not in cols_view]
-        data_view = data[cols_view + keep_extra]
-    else:
-        data_view = data
+        start = int(start)
+        cols_view = crit_cols[start:start + int(chunk)]
+        view = data[cols_view + other_cols]
 
-    n_rows_v = data_view.shape[0]
-    n_cols_v = data_view.shape[1]
+    n_rows = view.shape[0]
+    n_cols = view.shape[1]
 
-    zoom = st.slider("Heatmap zoom (px per column)", 20, 80, 40, help="Higher = wider cells")
-
-    fig = px.imshow(
-        data_view,
-        aspect="auto",
-        title=title
+    zoom = st.slider(
+        "Heatmap zoom (px per column)",
+        20, 80, 40,
+        key=f"{key_prefix}_zoom",
+        help="Higher = wider cells (horizontal scrolling enabled)."
     )
+
+    fig = px.imshow(view, aspect="auto", title=title)
     fig.update_layout(
-        width=max(900, zoom * n_cols_v),
-        height=max(500, 22 * n_rows_v),
+        width=max(900, zoom * n_cols),
+        height=max(500, 22 * n_rows),
         autosize=False,
         margin=dict(l=20, r=20, t=60, b=20),
         coloraxis_showscale=False
@@ -232,7 +228,6 @@ def draw_heatmap_with_controls(
     fig.update_xaxes(tickangle=45, tickfont=dict(size=10))
     fig.update_yaxes(tickfont=dict(size=11))
 
-    # Use_container_width=False so width setting is respected (horizontal scroll if needed)
     st.plotly_chart(fig, use_container_width=False)
 
 
@@ -259,7 +254,6 @@ except Exception as e:
 df_long = normalize_values(df_long)
 df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
 
-# Today + windows
 today = pd.Timestamp.now().normalize()
 d30 = today + pd.Timedelta(days=30)
 d60 = today + pd.Timedelta(days=60)
@@ -332,17 +326,8 @@ with tab_exec:
             use_container_width=True
         )
 
-    st.markdown("### Recommended actions")
-    st.markdown(
-        """
-- Clear **overdue goals first**, then focus on items due in the next 30 days.
-- Prioritize **weak criteria** that repeat across departments (systemic issues).
-- Use the **Clustered Heatmap** tab to group similar departments and apply shared remediation plans.
-        """
-    )
-
 # ======================================================
-# Overview (improved heatmap + keeps all extras)
+# Overview (heatmap + leaderboard + density + action lists)
 # ======================================================
 with tab_overview:
     st.subheader("Overview")
@@ -359,7 +344,7 @@ with tab_overview:
     c4.metric("Due in 30 days", int(due_30.shape[0]))
     c5.metric("Missing goals", int(dff[dff["Has_missing_goal"]].shape[0]))
 
-    st.subheader("Compliance heatmap (improved)")
+    st.subheader("Compliance heatmap (wide + zoom + chunking)")
 
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
     pivot = pivot.reindex(columns=criteria_order)
@@ -368,7 +353,8 @@ with tab_overview:
         sort_mode = st.radio(
             "Sort departments by",
             ["Lowest compliance first", "Highest compliance first", "Alphabetical"],
-            horizontal=True
+            horizontal=True,
+            key="overview_sort"
         )
         dept_avg = pivot.mean(axis=1)
         if sort_mode == "Lowest compliance first":
@@ -389,8 +375,7 @@ with tab_overview:
             pivot2,
             title="Heatmap: 1=Compliant, 0.5=Partial, 0=Not compliant (includes Dept Avg + Criteria Avg)",
             criteria_order=criteria_order,
-            show_chunking=True,
-            default_chunk=12
+            key_prefix="overview_heat"
         )
     else:
         st.info("No data to display (check filters).")
@@ -436,7 +421,7 @@ with tab_overview:
         st.dataframe(overdue_tbl, use_container_width=True)
 
     with t_due:
-        window = st.radio("Choose window", ["30 days", "60 days", "90 days"], horizontal=True)
+        window = st.radio("Choose window", ["30 days", "60 days", "90 days"], horizontal=True, key="due_window")
         if window == "30 days":
             due_tbl = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d30)]
             label_end = d30
@@ -485,7 +470,6 @@ with tab_timelines:
             x="Goal_date",
             y="Criteria",
             color="Compliance_status",
-            color_discrete_map={"Partial": "#F5C542", "Not compliant": "#E74C3C", "Blank": "#95A5A6"},
             title=f"{dept_timeline} – Goal Dates (open items only)",
             labels={"Goal_date": "Target date"}
         )
@@ -500,7 +484,6 @@ with tab_timelines:
             y="Criteria",
             orientation="h",
             color="Compliance_status",
-            color_discrete_map={"Partial": "#F5C542", "Not compliant": "#E74C3C", "Blank": "#95A5A6"},
             title=f"{dept_timeline} – Days Remaining (open items only)",
             labels={"Days_from_now": "Days from now"}
         )
@@ -534,15 +517,6 @@ with tab_radar:
             title=f"{dept_radar} – Compliance by Criteria"
         )
         fig_radar.update_traces(fill="toself")
-        fig_radar.update_layout(
-            polar=dict(
-                radialaxis=dict(
-                    tickvals=[0, 0.5, 1],
-                    ticktext=["Not compliant", "Partial", "Compliant"],
-                    visible=True
-                )
-            )
-        )
         st.plotly_chart(fig_radar, use_container_width=True)
 
 # ======================================================
@@ -554,9 +528,10 @@ with tab_cross:
     dept_plot = st.multiselect(
         "Choose departments to plot",
         options=all_depts,
-        default=dept_sel
+        default=dept_sel,
+        key="cross_depts"
     )
-    only_open = st.checkbox("Show only open items (Partial / Not compliant)", value=True)
+    only_open = st.checkbox("Show only open items (Partial / Not compliant)", value=True, key="cross_only_open")
 
     cross = df_long[df_long["Department"].isin(dept_plot)].copy()
     cross = cross[cross["Has_goal_date"]]
@@ -567,7 +542,6 @@ with tab_cross:
         st.info("No dated goals match your selection.")
     else:
         cross = cross.sort_values(["Criteria", "Goal_date"])
-
         fig_cross = px.scatter(
             cross,
             x="Goal_date",
@@ -582,7 +556,7 @@ with tab_cross:
         st.plotly_chart(fig_cross, use_container_width=True)
 
 # ======================================================
-# Clustered heatmap
+# Clustered heatmap (FIXED duplicate widget IDs)
 # ======================================================
 with tab_cluster:
     st.subheader("Clustered heatmap (departments grouped by similarity)")
@@ -604,8 +578,7 @@ with tab_cluster:
                 clustered,
                 title="Clustered compliance heatmap (similar departments are adjacent)",
                 criteria_order=criteria_order,
-                show_chunking=True,
-                default_chunk=12
+                key_prefix="cluster_heat"   # <-- unique keys here
             )
 
-            st.caption("Tip: Use this to build shared remediation plans for departments that fail the same criteria.")
+            st.caption("Departments close together have similar compliance patterns.")
