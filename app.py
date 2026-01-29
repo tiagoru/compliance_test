@@ -12,7 +12,6 @@ uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 # Helpers
 # ----------------------------
 def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
-    """Standardize compliance/goal values and compute a score for KPIs/heatmaps."""
     df = df_long.copy()
 
     def norm_compliance(x):
@@ -38,26 +37,16 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
 
     df["Compliance_status"] = df["Compliance_raw"].apply(norm_compliance)
     df["Goal_status"] = df["Goal_raw"].apply(norm_goal)
-
-    # Parse dd.mm.yyyy dates if present
     df["Goal_date"] = pd.to_datetime(df["Goal_raw"], format="%d.%m.%Y", errors="coerce")
 
-    # Score for charts
     score_map = {"Compliant": 1.0, "Partial": 0.5}
     df["Score"] = df["Compliance_status"].map(score_map).fillna(0.0)
-
     return df
 
 
 def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
-    """
-    Reads Excel where:
-    - Row 1 has Department labels repeated: A A B B C C ...
-    - Row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
-    """
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
 
-    # Forward-fill department names (merged cells often create blanks)
     tuples = []
     last_dept = None
     for dept, field in df.columns:
@@ -76,22 +65,15 @@ def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
 
 
 def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Convert 2-header wide format into long format AND return the criteria order as it appears in the sheet.
-    Output columns: Department, Criteria, Compliance_raw, Goal_raw
-    """
-    # Find criteria column (it might be ('Criteria','') or similar)
     criteria_col = None
     for col in df.columns:
         if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
             criteria_col = col
             break
-
     if criteria_col is None:
         raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
 
     criteria_series = df[criteria_col].rename("Criteria")
-    # Keep the criteria order exactly as in the sheet (first occurrence order)
     criteria_order = (
         criteria_series.dropna()
         .astype(str).str.strip()
@@ -101,12 +83,9 @@ def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     )
 
     rest = df.drop(columns=[criteria_col])
-
-    # Stack departments into rows; the second header level becomes regular columns
-    stacked = rest.stack(level=0).reset_index()  # columns: level_0, Department, <fields...>
+    stacked = rest.stack(level=0).reset_index()
     stacked = stacked.rename(columns={"level_1": "Department"})
 
-    # Detect compliance & goal columns from the second header row
     lower_map = {c: str(c).lower() for c in stacked.columns}
     compliance_col = next((c for c, v in lower_map.items() if "compliant" in v), None)
     goal_col = next((c for c, v in lower_map.items() if "goal" in v), None)
@@ -124,7 +103,6 @@ def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "Goal_raw": stacked[goal_col].values,
     })
 
-    # Drop blank criteria rows
     out["Criteria"] = out["Criteria"].astype(str).str.strip()
     out = out[out["Criteria"].ne("") & (out["Criteria"].str.lower() != "nan")]
 
@@ -142,7 +120,6 @@ xls = pd.ExcelFile(uploaded)
 sheet = st.selectbox("Select sheet", xls.sheet_names)
 
 df_wide = read_excel_two_header(uploaded, sheet)
-
 st.subheader("Preview (as uploaded)")
 st.dataframe(df_wide.head(15), use_container_width=True)
 
@@ -153,8 +130,6 @@ except Exception as e:
     st.stop()
 
 df_long = normalize_values(df_long)
-
-# Enforce criteria order everywhere (heatmap, timeline y-axis, radar)
 df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
 
 # Sidebar filters
@@ -172,7 +147,7 @@ status_sel = st.sidebar.multiselect(
 dff = df_long[df_long["Department"].isin(dept_sel)]
 dff = dff[dff["Compliance_status"].isin(status_sel)]
 
-tab1, tab2, tab3 = st.tabs(["Overview", "Timelines", "Radar"])
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Timelines", "Radar", "Cross-department Goals"])
 
 
 # ----------------------------
@@ -189,10 +164,7 @@ with tab1:
     c4.metric("Missing goals", int((dff["Goal_status"] == "Missing").sum()))
 
     st.subheader("Department × Criteria heatmap (score)")
-
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
-
-    # Force the heatmap columns to follow the original criteria order
     pivot = pivot.reindex(columns=criteria_order)
 
     if pivot.empty:
@@ -210,19 +182,12 @@ with tab1:
     missing = dff[dff["Goal_status"] == "Missing"][["Department", "Criteria", "Compliance_status", "Goal_status"]]
     st.dataframe(missing, use_container_width=True)
 
-    with st.expander("See normalized (long) table"):
-        st.dataframe(
-            dff[["Department", "Criteria", "Compliance_raw", "Goal_raw",
-                 "Compliance_status", "Goal_status", "Goal_date", "Score"]],
-            use_container_width=True
-        )
-
 
 # ----------------------------
-# Timelines tab
+# Timelines tab (single dept)
 # ----------------------------
 with tab2:
-    st.subheader("Goals timeline")
+    st.subheader("Goals timeline (single department)")
 
     dept_timeline = st.selectbox(
         "Select department for timeline",
@@ -239,14 +204,10 @@ with tab2:
     if timeline_df.empty:
         st.info("No dated goals for this department (or all items are compliant).")
     else:
-        # "Days from now" bar
-        today = pd.Timestamp.now(tz="Europe/Berlin").normalize().tz_localize(None)
+        today = pd.Timestamp.now().normalize()
         timeline_df["Days_from_now"] = (timeline_df["Goal_date"] - today).dt.days
-
-        # Sort by goal date (and keep criteria order via categorical)
         timeline_df = timeline_df.sort_values(["Goal_date", "Criteria"])
 
-        # 1) Timeline scatter
         fig_timeline = px.scatter(
             timeline_df,
             x="Goal_date",
@@ -264,9 +225,7 @@ with tab2:
         fig_timeline.update_layout(yaxis=dict(categoryorder="array", categoryarray=criteria_order))
         st.plotly_chart(fig_timeline, use_container_width=True)
 
-        # 2) Days-from-now bar chart
         st.subheader("Days from now to each goal date (negative = overdue)")
-
         fig_days = px.bar(
             timeline_df,
             x="Days_from_now",
@@ -281,11 +240,9 @@ with tab2:
             title=f"{dept_timeline} – Days Remaining",
             labels={"Days_from_now": "Days from now"}
         )
-        # Put earliest goals at top
         fig_days.update_layout(
             yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=criteria_order)
         )
-        # Add a vertical line at 0 (today)
         fig_days.add_vline(x=0, line_width=2, line_dash="dash")
         st.plotly_chart(fig_days, use_container_width=True)
 
@@ -307,7 +264,6 @@ with tab3:
     if radar_df.empty:
         st.info("No data for this department.")
     else:
-        # Ensure radar follows the original criteria order
         radar_df = radar_df.sort_values("Criteria")
 
         fig_radar = px.line_polar(
@@ -329,3 +285,56 @@ with tab3:
             )
         )
         st.plotly_chart(fig_radar, use_container_width=True)
+
+
+# ----------------------------
+# Cross-department goals plot (what you asked for)
+# ----------------------------
+with tab4:
+    st.subheader("Cross-department goals timeline (select departments)")
+
+    # User chooses which departments to plot (can be subset)
+    dept_plot = st.multiselect(
+        "Choose departments to plot",
+        options=all_depts,
+        default=dept_sel  # start with current sidebar selection
+    )
+
+    # Option to include only non-compliant/partial, or include all
+    only_open = st.checkbox("Show only items that are not Compliant (recommended)", value=True)
+
+    cross = df_long[df_long["Department"].isin(dept_plot)].copy()
+    cross = cross[cross["Goal_date"].notna()]
+
+    if only_open:
+        cross = cross[cross["Compliance_status"] != "Compliant"]
+
+    if cross.empty:
+        st.info("No dated goals match your selection.")
+    else:
+        # Keep criteria order
+        cross = cross.sort_values(["Criteria", "Goal_date"])
+
+        fig_cross = px.scatter(
+            cross,
+            x="Goal_date",
+            y="Criteria",
+            color="Department",
+            symbol="Compliance_status",
+            title="Goals Timeline: X = Goal Date, Y = Criteria, Color = Department",
+            labels={"Goal_date": "Goal date"}
+        )
+        fig_cross.update_traces(marker=dict(size=10))
+        fig_cross.update_layout(
+            yaxis=dict(categoryorder="array", categoryarray=criteria_order),
+            legend_title_text="Department"
+        )
+        st.plotly_chart(fig_cross, use_container_width=True)
+
+        # Optional: show a small table to support the chart
+        with st.expander("See underlying rows used in this chart"):
+            st.dataframe(
+                cross[["Department", "Criteria", "Compliance_status", "Goal_raw", "Goal_date"]]
+                .sort_values(["Department", "Goal_date", "Criteria"]),
+                use_container_width=True
+            )
