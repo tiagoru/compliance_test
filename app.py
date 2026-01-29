@@ -609,4 +609,3 @@ with tab_cluster:
             )
 
             st.caption("Tip: Use this to build shared remediation plans for departments that fail the same criteria.")
-
