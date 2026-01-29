@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 
 st.set_page_config(page_title="Compliance Dashboard", layout="wide")
 st.title("Compliance Dashboard")
@@ -7,6 +8,9 @@ st.title("Compliance Dashboard")
 uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     """Standardize compliance/goal values and compute a score for KPIs/heatmaps."""
     df = df_long.copy()
@@ -35,10 +39,10 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df["Compliance_status"] = df["Compliance_raw"].apply(norm_compliance)
     df["Goal_status"] = df["Goal_raw"].apply(norm_goal)
 
-    # Optional: parse goal date if present (dd.mm.yyyy)
+    # Parse dd.mm.yyyy dates if present
     df["Goal_date"] = pd.to_datetime(df["Goal_raw"], format="%d.%m.%Y", errors="coerce")
 
-    # Score: Compliant=1, Partial=0.5, else 0
+    # Score for charts
     score_map = {"Compliant": 1.0, "Partial": 0.5}
     df["Score"] = df["Compliance_status"].map(score_map).fillna(0.0)
 
@@ -47,7 +51,7 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
 
 def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
     """
-    Reads your Excel where:
+    Reads Excel where:
     - Row 1 has Department labels repeated: A A B B C C ...
     - Row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
     """
@@ -115,44 +119,55 @@ def to_long(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-if uploaded:
-    # Read Excel
-    xls = pd.ExcelFile(uploaded)
-    sheet = st.selectbox("Select sheet", xls.sheet_names)
+# ----------------------------
+# App
+# ----------------------------
+if not uploaded:
+    st.info("Upload an Excel file to begin.")
+    st.stop()
 
-    # IMPORTANT CHANGE: read with two header rows
-    df_wide = read_excel_two_header(uploaded, sheet)
+# Read Excel
+xls = pd.ExcelFile(uploaded)
+sheet = st.selectbox("Select sheet", xls.sheet_names)
 
-    st.subheader("Preview (as uploaded)")
-    st.dataframe(df_wide.head(15), use_container_width=True)
+df_wide = read_excel_two_header(uploaded, sheet)
 
-    # Convert to long + normalize
-    try:
-        df_long = to_long(df_wide)
-    except Exception as e:
-        st.error(f"Failed to reshape your Excel file: {e}")
-        st.stop()
+st.subheader("Preview (as uploaded)")
+st.dataframe(df_wide.head(15), use_container_width=True)
 
-    df_long = normalize_values(df_long)
+# Convert to long + normalize
+try:
+    df_long = to_long(df_wide)
+except Exception as e:
+    st.error(f"Failed to reshape your Excel file: {e}")
+    st.stop()
 
-    # Sidebar filters
-    st.sidebar.header("Filters")
-    dept_sel = st.sidebar.multiselect(
-        "Department",
-        sorted(df_long["Department"].dropna().unique()),
-        default=sorted(df_long["Department"].dropna().unique())
-    )
-    status_sel = st.sidebar.multiselect(
-        "Compliance status",
-        ["Compliant", "Partial", "Not compliant", "Blank"],
-        default=["Compliant", "Partial", "Not compliant"]
-    )
+df_long = normalize_values(df_long)
 
-    dff = df_long[df_long["Department"].isin(dept_sel)]
-    dff = dff[dff["Compliance_status"].isin(status_sel)]
+# Sidebar filters
+st.sidebar.header("Filters")
+all_depts = sorted(df_long["Department"].dropna().unique())
+dept_sel = st.sidebar.multiselect("Department", all_depts, default=all_depts)
 
-    # KPIs
+status_options = ["Compliant", "Partial", "Not compliant", "Blank"]
+status_sel = st.sidebar.multiselect(
+    "Compliance status",
+    status_options,
+    default=["Compliant", "Partial", "Not compliant"]
+)
+
+dff = df_long[df_long["Department"].isin(dept_sel)]
+dff = dff[dff["Compliance_status"].isin(status_sel)]
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["Overview", "Timelines", "Radar"])
+
+# ----------------------------
+# Overview tab
+# ----------------------------
+with tab1:
     st.subheader("Overview")
+
     c1, c2, c3, c4 = st.columns(4)
     overall = (dff["Score"].mean() * 100) if len(dff) else 0
     c1.metric("Overall compliance", f"{overall:.1f}%")
@@ -160,21 +175,24 @@ if uploaded:
     c3.metric("Partial", int((dff["Compliance_status"] == "Partial").sum()))
     c4.metric("Missing goals", int((dff["Goal_status"] == "Missing").sum()))
 
-    # Heatmap matrix (pivot + background gradient)
-    st.subheader("Department × Criteria matrix (score)")
+    st.subheader("Department × Criteria heatmap (score)")
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
 
-    st.dataframe(
-        pivot.style.format("{:.1f}").background_gradient(axis=None),
-        use_container_width=True
-    )
+    if pivot.empty:
+        st.info("No data to display (check filters).")
+    else:
+        fig_heat = px.imshow(
+            pivot,
+            aspect="auto",
+            title="Compliance Heatmap (1=Compliant, 0.5=Partial, 0=Not compliant)"
+        )
+        fig_heat.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(fig_heat, use_container_width=True)
 
-    # Action list: missing goals
     st.subheader("Action list: Missing goals")
     missing = dff[dff["Goal_status"] == "Missing"][["Department", "Criteria", "Compliance_status", "Goal_status"]]
     st.dataframe(missing, use_container_width=True)
 
-    # Debug table
     with st.expander("See normalized (long) table"):
         st.dataframe(
             dff[["Department", "Criteria", "Compliance_raw", "Goal_raw",
@@ -182,92 +200,81 @@ if uploaded:
             use_container_width=True
         )
 
-st.subheader("Goals timeline")
+# ----------------------------
+# Timelines tab
+# ----------------------------
+with tab2:
+    st.subheader("Goals timeline")
 
-dept_timeline = st.selectbox(
-    "Select department for timeline",
-    sorted(df_long["Department"].dropna().unique())
-)
-
-timeline_df = df_long[
-    (df_long["Department"] == dept_timeline) &
-    (df_long["Goal_date"].notna()) &
-    (df_long["Compliance_status"] != "Compliant")
-].copy()
-
-if timeline_df.empty:
-    st.info("No dated goals for this department.")
-else:
-    timeline_df = timeline_df.sort_values("Goal_date")
-
-    fig_timeline = px.scatter(
-        timeline_df,
-        x="Goal_date",
-        y="Criteria",
-        color="Compliance_status",
-        color_discrete_map={
-            "Partial": "#F5C542",        # amber
-            "Not compliant": "#E74C3C"   # red
-        },
-        title=f"{dept_timeline} – Goal Timeline",
-        labels={"Goal_date": "Target date"}
+    dept_timeline = st.selectbox(
+        "Select department for timeline",
+        sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
+        key="timeline_dept"
     )
 
-    fig_timeline.update_traces(marker=dict(size=12))
-    fig_timeline.update_layout(yaxis=dict(autorange="reversed"))
+    timeline_df = df_long[
+        (df_long["Department"] == dept_timeline) &
+        (df_long["Goal_date"].notna()) &
+        (df_long["Compliance_status"] != "Compliant")
+    ].copy()
 
-    st.plotly_chart(fig_timeline, use_container_width=True)
+    if timeline_df.empty:
+        st.info("No dated goals for this department (or all items are compliant).")
+    else:
+        timeline_df = timeline_df.sort_values("Goal_date")
 
-st.subheader("Criteria compliance radar")
+        fig_timeline = px.scatter(
+            timeline_df,
+            x="Goal_date",
+            y="Criteria",
+            color="Compliance_status",
+            color_discrete_map={
+                "Partial": "#F5C542",        # amber
+                "Not compliant": "#E74C3C",  # red
+                "Blank": "#95A5A6"           # grey (if it appears)
+            },
+            title=f"{dept_timeline} – Goal Timeline",
+            labels={"Goal_date": "Target date"}
+        )
+        fig_timeline.update_traces(marker=dict(size=12))
+        fig_timeline.update_layout(yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig_timeline, use_container_width=True)
 
-dept_radar = st.selectbox(
-    "Select department for radar",
-    sorted(df_long["Department"].dropna().unique()),
-    key="radar_dept"
-)
+# ----------------------------
+# Radar tab
+# ----------------------------
+with tab3:
+    st.subheader("Criteria compliance radar")
 
-radar_df = df_long[df_long["Department"] == dept_radar].copy()
-
-if radar_df.empty:
-    st.info("No data for this department.")
-else:
-    radar_df = radar_df.sort_values("Criteria")
-
-    fig_radar = px.line_polar(
-        radar_df,
-        r="Score",
-        theta="Criteria",
-        line_close=True,
-        range_r=[0, 1],
-        title=f"{dept_radar} – Compliance by Criteria"
+    dept_radar = st.selectbox(
+        "Select department for radar",
+        sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
+        key="radar_dept"
     )
 
-    fig_radar.update_traces(
-        fill="toself",
-        fillcolor="rgba(46, 204, 113, 0.3)",  # soft green
-        line=dict(color="#2ECC71")
-    )
+    radar_df = df_long[df_long["Department"] == dept_radar].copy()
 
-    fig_radar.update_layout(
-        polar=dict(
-            radialaxis=dict(
-                tickvals=[0, 0.5, 1],
-                ticktext=["Not compliant", "Partial", "Compliant"],
-                visible=True
+    if radar_df.empty:
+        st.info("No data for this department.")
+    else:
+        radar_df = radar_df.sort_values("Criteria")
+
+        fig_radar = px.line_polar(
+            radar_df,
+            r="Score",
+            theta="Criteria",
+            line_close=True,
+            range_r=[0, 1],
+            title=f"{dept_radar} – Compliance by Criteria"
+        )
+        fig_radar.update_traces(fill="toself")
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    tickvals=[0, 0.5, 1],
+                    ticktext=["Not compliant", "Partial", "Compliant"],
+                    visible=True
+                )
             )
         )
-    )
-
-    st.plotly_chart(fig_radar, use_container_width=True)
-
-tab1, tab2, tab3 = st.tabs(["Overview", "Timelines", "Radar"])
-
-with tab1:
-    # KPIs + heatmap
-
-with tab2:
-    # Timeline code
-
-with tab3:
-    # Radar code
-
+        st.plotly_chart(fig_radar, use_container_width=True)
