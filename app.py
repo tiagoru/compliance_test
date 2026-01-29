@@ -181,3 +181,93 @@ if uploaded:
                  "Compliance_status", "Goal_status", "Goal_date", "Score"]],
             use_container_width=True
         )
+
+st.subheader("Goals timeline")
+
+dept_timeline = st.selectbox(
+    "Select department for timeline",
+    sorted(df_long["Department"].dropna().unique())
+)
+
+timeline_df = df_long[
+    (df_long["Department"] == dept_timeline) &
+    (df_long["Goal_date"].notna()) &
+    (df_long["Compliance_status"] != "Compliant")
+].copy()
+
+if timeline_df.empty:
+    st.info("No dated goals for this department.")
+else:
+    timeline_df = timeline_df.sort_values("Goal_date")
+
+    fig_timeline = px.scatter(
+        timeline_df,
+        x="Goal_date",
+        y="Criteria",
+        color="Compliance_status",
+        color_discrete_map={
+            "Partial": "#F5C542",        # amber
+            "Not compliant": "#E74C3C"   # red
+        },
+        title=f"{dept_timeline} – Goal Timeline",
+        labels={"Goal_date": "Target date"}
+    )
+
+    fig_timeline.update_traces(marker=dict(size=12))
+    fig_timeline.update_layout(yaxis=dict(autorange="reversed"))
+
+    st.plotly_chart(fig_timeline, use_container_width=True)
+
+st.subheader("Criteria compliance radar")
+
+dept_radar = st.selectbox(
+    "Select department for radar",
+    sorted(df_long["Department"].dropna().unique()),
+    key="radar_dept"
+)
+
+radar_df = df_long[df_long["Department"] == dept_radar].copy()
+
+if radar_df.empty:
+    st.info("No data for this department.")
+else:
+    radar_df = radar_df.sort_values("Criteria")
+
+    fig_radar = px.line_polar(
+        radar_df,
+        r="Score",
+        theta="Criteria",
+        line_close=True,
+        range_r=[0, 1],
+        title=f"{dept_radar} – Compliance by Criteria"
+    )
+
+    fig_radar.update_traces(
+        fill="toself",
+        fillcolor="rgba(46, 204, 113, 0.3)",  # soft green
+        line=dict(color="#2ECC71")
+    )
+
+    fig_radar.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                tickvals=[0, 0.5, 1],
+                ticktext=["Not compliant", "Partial", "Compliant"],
+                visible=True
+            )
+        )
+    )
+
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+tab1, tab2, tab3 = st.tabs(["Overview", "Timelines", "Radar"])
+
+with tab1:
+    # KPIs + heatmap
+
+with tab2:
+    # Timeline code
+
+with tab3:
+    # Radar code
+
