@@ -1,77 +1,179 @@
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-from scipy.cluster.hierarchy import linkage, leaves_list
+
+# SciPy is needed for clustering; we'll fail gracefully if missing.
+try:
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
 
 st.set_page_config(page_title="Compliance Dashboard", layout="wide")
 st.title("Compliance Dashboard")
 
 uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
+
 # ======================================================
 # Helpers
 # ======================================================
-def normalize_values(df):
+def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
+    df = df_long.copy()
+
     def norm_compliance(x):
-        x = "" if pd.isna(x) else str(x).strip().lower()
-        if x in ["yes", "y", "1", "true"]:
+        x = "" if pd.isna(x) else str(x).strip()
+        xl = x.lower()
+        if xl in ["yes", "y", "1", "true"]:
             return "Compliant"
-        if x in ["no", "n", "0", "false"]:
+        if xl in ["no", "n", "0", "false"]:
             return "Not compliant"
-        if "partial" in x:
+        if "partial" in xl:
             return "Partial"
-        return "Blank"
+        if x == "":
+            return "Blank"
+        return x  # keep unexpected text
+
+    def norm_goal(x):
+        x = "" if pd.isna(x) else str(x).strip()
+        if x.upper() == "MISSING":
+            return "Missing"
+        if x == "":
+            return "Blank"
+        return x
 
     df["Compliance_status"] = df["Compliance_raw"].apply(norm_compliance)
+    df["Goal_status"] = df["Goal_raw"].apply(norm_goal)
+
+    # Parse dd.mm.yyyy dates if present
     df["Goal_date"] = pd.to_datetime(df["Goal_raw"], format="%d.%m.%Y", errors="coerce")
 
+    # Score for charts
     score_map = {"Compliant": 1.0, "Partial": 0.5}
     df["Score"] = df["Compliance_status"].map(score_map).fillna(0.0)
 
-    df["Is_open"] = df["Compliance_status"].isin(["Partial", "Not compliant"])
+    # Convenience flags
+    df["Is_open_item"] = df["Compliance_status"].isin(["Partial", "Not compliant"])
+    df["Has_goal_date"] = df["Goal_date"].notna()
+    df["Has_missing_goal"] = df["Goal_status"].eq("Missing")
+
     return df
 
 
-def read_excel_two_header(uploaded_file, sheet):
-    df = pd.read_excel(uploaded_file, sheet_name=sheet, header=[0, 1])
-    tuples, last = [], None
-    for d, f in df.columns:
-        d = "" if pd.isna(d) else str(d).strip()
-        f = "" if pd.isna(f) else str(f).strip()
-        if d:
-            last = d
+def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
+    """
+    Reads Excel where:
+    - Row 1 has Department labels repeated: A A B B C C ...
+    - Row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
+    """
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
+
+    # Forward-fill department names (merged cells often create blanks)
+    tuples = []
+    last_dept = None
+    for dept, field in df.columns:
+        dept = "" if pd.isna(dept) else str(dept).strip()
+        field = "" if pd.isna(field) else str(field).strip()
+
+        if dept:
+            last_dept = dept
         else:
-            d = last
-        tuples.append((d, f))
+            dept = last_dept
+
+        tuples.append((dept, field))
+
     df.columns = pd.MultiIndex.from_tuples(tuples)
     return df
 
 
-def to_long(df):
-    crit_col = next(c for c in df.columns if "criteria" in str(c).lower())
-    criteria = df[crit_col]
-    order = criteria.dropna().astype(str).str.strip().tolist()
+def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Convert 2-header wide format into long format AND return criteria order as in the sheet.
+    Output columns: Department, Criteria, Compliance_raw, Goal_raw
+    """
+    criteria_col = None
+    for col in df.columns:
+        if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
+            criteria_col = col
+            break
+    if criteria_col is None:
+        raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
 
-    rest = df.drop(columns=[crit_col])
-    stacked = rest.stack(level=0).reset_index().rename(columns={"level_1": "Department"})
+    criteria_series = df[criteria_col].rename("Criteria")
+    criteria_order = (
+        criteria_series.dropna()
+        .astype(str).str.strip()
+        .loc[lambda s: (s != "") & (s.str.lower() != "nan")]
+        .drop_duplicates()
+        .tolist()
+    )
 
-    comp_col = next(c for c in stacked.columns if "compliant" in str(c).lower())
-    goal_col = next(c for c in stacked.columns if "goal" in str(c).lower())
+    rest = df.drop(columns=[criteria_col])
+    stacked = rest.stack(level=0).reset_index()
+    stacked = stacked.rename(columns={"level_1": "Department"})
+
+    lower_map = {c: str(c).lower() for c in stacked.columns}
+    compliance_col = next((c for c, v in lower_map.items() if "compliant" in v), None)
+    goal_col = next((c for c, v in lower_map.items() if "goal" in v), None)
+
+    if compliance_col is None or goal_col is None:
+        raise ValueError(
+            "Couldn't detect 'Compliant' and 'Goal' columns in the second header row. "
+            "Ensure the second header row contains words like 'Compliant?' and 'Goal'."
+        )
 
     out = pd.DataFrame({
         "Department": stacked["Department"],
-        "Criteria": criteria.loc[stacked["level_0"]].values,
-        "Compliance_raw": stacked[comp_col].values,
-        "Goal_raw": stacked[goal_col].values
+        "Criteria": criteria_series.loc[stacked["level_0"]].values,
+        "Compliance_raw": stacked[compliance_col].values,
+        "Goal_raw": stacked[goal_col].values,
     })
 
-    out = out.dropna(subset=["Criteria"])
     out["Criteria"] = out["Criteria"].astype(str).str.strip()
-    return out, list(dict.fromkeys(order))
+    out = out[out["Criteria"].ne("") & (out["Criteria"].str.lower() != "nan")]
+
+    return out, criteria_order
+
+
+def dept_leaderboard(df_in: pd.DataFrame, today: pd.Timestamp, d30: pd.Timestamp) -> pd.DataFrame:
+    grp = df_in.groupby("Department", dropna=True)
+
+    out = grp.agg(
+        Criteria_count=("Criteria", "nunique"),
+        Compliance_pct=("Score", lambda s: round(float(s.mean() * 100), 1) if len(s) else 0.0),
+        Open_items=("Is_open_item", "sum"),
+        Missing_goals=("Has_missing_goal", "sum"),
+        Dated_goals=("Has_goal_date", "sum"),
+    ).reset_index()
+
+    # Overdue and due soon (open items only)
+    mask_open = df_in["Is_open_item"]
+    mask_overdue = mask_open & df_in["Has_goal_date"] & (df_in["Goal_date"] < today)
+    mask_due30 = mask_open & df_in["Has_goal_date"] & (df_in["Goal_date"] >= today) & (df_in["Goal_date"] <= d30)
+
+    def count_mask_for_dept(dept: str, mask: pd.Series) -> int:
+        idx = df_in["Department"] == dept
+        return int(mask[idx].sum())
+
+    out["Overdue"] = out["Department"].apply(lambda d: count_mask_for_dept(d, mask_overdue))
+    out["Due_30d"] = out["Department"].apply(lambda d: count_mask_for_dept(d, mask_due30))
+
+    # Avg days to goal (open items with dates)
+    def avg_days_open(dept: str):
+        sub = df_in[(df_in["Department"] == dept) & mask_open & df_in["Has_goal_date"]]
+        if sub.empty:
+            return None
+        return float((sub["Goal_date"] - today).dt.days.mean())
+
+    out["Avg_days_to_goal_open"] = out["Department"].apply(avg_days_open).round(1)
+
+    # Sort: most overdue, then lowest compliance
+    out = out.sort_values(["Overdue", "Compliance_pct"], ascending=[False, True])
+    return out
 
 
 # ======================================================
-# App
+# App start
 # ======================================================
 if not uploaded:
     st.info("Upload an Excel file to begin.")
@@ -81,133 +183,388 @@ xls = pd.ExcelFile(uploaded)
 sheet = st.selectbox("Select sheet", xls.sheet_names)
 
 df_wide = read_excel_two_header(uploaded, sheet)
-df_long, criteria_order = to_long(df_wide)
-df_long = normalize_values(df_long)
+st.subheader("Preview (as uploaded)")
+st.dataframe(df_wide.head(15), use_container_width=True)
 
+try:
+    df_long, criteria_order = to_long_with_order(df_wide)
+except Exception as e:
+    st.error(f"Failed to reshape your Excel file: {e}")
+    st.stop()
+
+df_long = normalize_values(df_long)
 df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
 
-today = pd.Timestamp.today().normalize()
+# Today + windows (no timezone headaches)
+today = pd.Timestamp.now().normalize()
+d30 = today + pd.Timedelta(days=30)
+d60 = today + pd.Timedelta(days=60)
+d90 = today + pd.Timedelta(days=90)
 
-# ======================================================
-# Tabs
-# ======================================================
-tab_exec, tab_overview, tab_cluster = st.tabs(
-    ["Executive Summary", "Overview Heatmap", "Clustered Heatmap"]
+# Sidebar filters (apply to most tabs)
+st.sidebar.header("Filters")
+all_depts = sorted(df_long["Department"].dropna().unique())
+dept_sel = st.sidebar.multiselect("Department", all_depts, default=all_depts)
+
+status_options = ["Compliant", "Partial", "Not compliant", "Blank"]
+status_sel = st.sidebar.multiselect(
+    "Compliance status",
+    status_options,
+    default=["Compliant", "Partial", "Not compliant"]
+)
+
+dff = df_long[df_long["Department"].isin(dept_sel)]
+dff = dff[dff["Compliance_status"].isin(status_sel)]
+
+# Tabs (keeps ALL features + adds new ones)
+tab_exec, tab_overview, tab_timelines, tab_radar, tab_cross, tab_cluster = st.tabs(
+    ["Executive Summary", "Overview", "Timelines", "Radar", "Cross-department Goals", "Clustered Heatmap"]
 )
 
 # ======================================================
-# 1️⃣ EXECUTIVE SUMMARY TAB
+# Executive Summary (NEW)
 # ======================================================
 with tab_exec:
-    st.subheader("Executive Compliance Summary")
+    st.subheader("Executive Summary (one screen)")
 
-    overall = df_long["Score"].mean() * 100
-    open_items = df_long[df_long["Is_open"]]
-    overdue = open_items[open_items["Goal_date"] < today]
+    overall = (dff["Score"].mean() * 100) if len(dff) else 0
+    open_items = dff[dff["Is_open_item"]]
+    overdue = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] < today)]
+    due_30 = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d30)]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Overall Compliance", f"{overall:.1f}%")
-    c2.metric("Open Items", len(open_items))
-    c3.metric("Overdue Items", len(overdue))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Overall compliance", f"{overall:.1f}%")
+    c2.metric("Open items", int(open_items.shape[0]))
+    c3.metric("Overdue goals", int(overdue.shape[0]))
+    c4.metric("Due in 30 days", int(due_30.shape[0]))
 
-    weakest_criteria = (
-        df_long.groupby("Criteria")["Score"].mean()
-        .sort_values()
-        .head(3)
-        .index.tolist()
-    )
+    # Weakest criteria & departments (based on mean score)
+    crit_means = dff.groupby("Criteria")["Score"].mean().sort_values()
+    dept_means = dff.groupby("Department")["Score"].mean().sort_values()
 
-    weakest_departments = (
-        df_long.groupby("Department")["Score"].mean()
-        .sort_values()
-        .head(3)
-        .index.tolist()
-    )
+    weakest_criteria = [str(x) for x in crit_means.head(5).index.tolist()] if not crit_means.empty else []
+    weakest_depts = [str(x) for x in dept_means.head(5).index.tolist()] if not dept_means.empty else []
 
-    st.markdown("### Key Insights")
+    st.markdown("### Key insights")
     st.markdown(
         f"""
-- Overall compliance is **{overall:.1f}%**.
-- There are **{len(open_items)} open items**, with **{len(overdue)} overdue**.
-- Weakest criteria: **{", ".join(weakest_criteria)}**.
-- Departments requiring attention: **{", ".join(weakest_departments)}**.
+- **As of {today.date()}**, overall compliance is **{overall:.1f}%** across the selected departments.
+- There are **{int(open_items.shape[0])} open items** (Partial / Not compliant).
+- **{int(overdue.shape[0])} items are overdue**, and **{int(due_30.shape[0])} are due within 30 days**.
+- Weakest criteria (lowest average compliance): **{", ".join(weakest_criteria[:3]) if weakest_criteria else "—"}**
+- Departments needing attention (lowest average compliance): **{", ".join(weakest_depts[:3]) if weakest_depts else "—"}**
         """
     )
 
-    st.markdown("### Recommended Actions")
+    # Top 10 urgent list
+    st.markdown("### Top urgent items (overdue first)")
+    urgent = open_items[open_items["Has_goal_date"]].copy()
+    urgent["Days_from_now"] = (urgent["Goal_date"] - today).dt.days
+    urgent = urgent.sort_values(["Days_from_now", "Department", "Criteria"]).head(10)
+
+    if urgent.empty:
+        st.info("No dated goals for open items in the current selection.")
+    else:
+        st.dataframe(
+            urgent[["Department", "Criteria", "Compliance_status", "Goal_date", "Days_from_now"]],
+            use_container_width=True
+        )
+
+    st.markdown("### Recommended actions")
     st.markdown(
         """
-- Prioritize overdue items in low-performing departments.
-- Address systemic issues in weak criteria.
-- Align similar departments with shared remediation plans.
+- **Clear overdue goals first**, then focus on items due in the next 30 days.
+- Prioritize **systemic criteria** that are weak across many departments.
+- Use the **Clustered Heatmap** tab to group similar departments and apply shared remediation plans.
         """
     )
 
 # ======================================================
-# 2️⃣ IMPROVED HEATMAP TAB
+# Overview (IMPROVED heatmap + keeps existing extras)
 # ======================================================
 with tab_overview:
-    st.subheader("Compliance Heatmap (Sorted & Enhanced)")
+    st.subheader("Overview")
 
-    pivot = df_long.pivot_table(
-        index="Department",
-        columns="Criteria",
-        values="Score",
-        aggfunc="max"
-    ).fillna(0)
+    open_items = dff[dff["Is_open_item"]]
+    overdue = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] < today)]
+    due_30 = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d30)]
 
-    # Sort departments by average compliance
-    dept_avg = pivot.mean(axis=1).sort_values()
-    pivot = pivot.loc[dept_avg.index]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    overall = (dff["Score"].mean() * 100) if len(dff) else 0
+    c1.metric("Overall compliance", f"{overall:.1f}%")
+    c2.metric("Open items", int(open_items.shape[0]))
+    c3.metric("Overdue goals", int(overdue.shape[0]))
+    c4.metric("Due in 30 days", int(due_30.shape[0]))
+    c5.metric("Missing goals", int(dff[dff["Has_missing_goal"]].shape[0]))
+
+    st.subheader("Compliance heatmap (improved)")
+
+    pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
     pivot = pivot.reindex(columns=criteria_order)
 
-    # Add averages
-    pivot["Dept Avg"] = pivot.mean(axis=1)
-    crit_avg = pivot.mean(axis=0)
-    pivot.loc["Criteria Avg"] = crit_avg
+    if pivot.empty:
+        st.info("No data to display (check filters).")
+    else:
+        # Improve: sort departments by average compliance + add averages
+        sort_mode = st.radio(
+            "Sort departments by",
+            ["Lowest compliance first", "Highest compliance first", "Alphabetical"],
+            horizontal=True
+        )
 
-    fig = px.imshow(
-        pivot,
-        aspect="auto",
-        title="Compliance Heatmap (Departments sorted by performance)"
-    )
-    fig.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
+        dept_avg = pivot.mean(axis=1)
+        if sort_mode == "Lowest compliance first":
+            pivot = pivot.loc[dept_avg.sort_values(ascending=True).index]
+        elif sort_mode == "Highest compliance first":
+            pivot = pivot.loc[dept_avg.sort_values(ascending=False).index]
+        else:
+            pivot = pivot.sort_index()
 
-    st.caption("Green = compliant, amber = partial, grey = non-compliant.")
+        pivot2 = pivot.copy()
+        pivot2["Dept Avg"] = pivot2.mean(axis=1)
+        criteria_avg = pivot2.drop(columns=["Dept Avg"]).mean(axis=0)
+        criteria_avg["Dept Avg"] = pivot2["Dept Avg"].mean()
+        pivot2.loc["Criteria Avg"] = criteria_avg
+
+        fig_heat = px.imshow(
+            pivot2,
+            aspect="auto",
+            title="Heatmap: 1=Compliant, 0.5=Partial, 0=Not compliant (includes Dept Avg + Criteria Avg)"
+        )
+        fig_heat.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    # Department leaderboard (kept)
+    st.subheader("Department leaderboard")
+    leaderboard = dept_leaderboard(dff, today=today, d30=d30)
+    st.dataframe(leaderboard, use_container_width=True)
+
+    # Goal density over time (kept)
+    st.subheader("Goal density over time (open items only)")
+    goal_density = open_items[open_items["Has_goal_date"]].copy()
+    if goal_density.empty:
+        st.info("No dated goals for open items in the current selection.")
+    else:
+        goal_density["Month"] = goal_density["Goal_date"].dt.to_period("M").dt.to_timestamp()
+        density = (
+            goal_density.groupby(["Month", "Department"], as_index=False)
+            .size()
+            .rename(columns={"size": "Goal_count"})
+            .sort_values("Month")
+        )
+        fig_density = px.bar(
+            density,
+            x="Month",
+            y="Goal_count",
+            color="Department",
+            barmode="stack",
+            title="Open-item goals due by month (stacked by department)",
+            labels={"Goal_count": "Goals due"}
+        )
+        st.plotly_chart(fig_density, use_container_width=True)
+
+    # Action lists (kept + split)
+    st.subheader("Action lists")
+    t_missing, t_overdue, t_due = st.tabs(["Missing goals", "Overdue", "Due soon (30/60/90)"])
+
+    with t_missing:
+        miss_tbl = dff[dff["Has_missing_goal"]][["Department", "Criteria", "Compliance_status", "Goal_raw"]]
+        st.dataframe(miss_tbl, use_container_width=True)
+
+    with t_overdue:
+        overdue_tbl = overdue[["Department", "Criteria", "Compliance_status", "Goal_date"]].sort_values(
+            ["Department", "Goal_date", "Criteria"]
+        )
+        st.dataframe(overdue_tbl, use_container_width=True)
+
+    with t_due:
+        window = st.radio("Choose window", ["30 days", "60 days", "90 days"], horizontal=True)
+        if window == "30 days":
+            due_tbl = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d30)]
+            label_end = d30
+        elif window == "60 days":
+            due_tbl = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d60)]
+            label_end = d60
+        else:
+            due_tbl = open_items[open_items["Has_goal_date"] & (open_items["Goal_date"] >= today) & (open_items["Goal_date"] <= d90)]
+            label_end = d90
+
+        st.caption(f"Open items with goal dates between {today.date()} and {label_end.date()}.")
+        due_tbl = due_tbl.copy()
+        due_tbl["Days_from_now"] = (due_tbl["Goal_date"] - today).dt.days
+        st.dataframe(
+            due_tbl[["Department", "Criteria", "Compliance_status", "Goal_date", "Days_from_now"]]
+            .sort_values(["Goal_date", "Department", "Criteria"]),
+            use_container_width=True
+        )
+
+    with st.expander("See normalized (long) table"):
+        st.dataframe(
+            dff[["Department", "Criteria", "Compliance_raw", "Goal_raw",
+                 "Compliance_status", "Goal_status", "Goal_date", "Score"]],
+            use_container_width=True
+        )
 
 # ======================================================
-# 3️⃣ CLUSTERED HEATMAP TAB
+# Timelines (single department + days bar) (kept)
+# ======================================================
+with tab_timelines:
+    st.subheader("Goals timeline (single department)")
+
+    dept_timeline = st.selectbox(
+        "Select department for timeline",
+        sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
+        key="timeline_dept"
+    )
+
+    timeline_df = df_long[
+        (df_long["Department"] == dept_timeline) &
+        (df_long["Has_goal_date"]) &
+        (df_long["Is_open_item"])
+    ].copy()
+
+    if timeline_df.empty:
+        st.info("No dated goals for open items (Partial/Not compliant) in this department.")
+    else:
+        timeline_df["Days_from_now"] = (timeline_df["Goal_date"] - today).dt.days
+        timeline_df = timeline_df.sort_values(["Goal_date", "Criteria"])
+
+        fig_timeline = px.scatter(
+            timeline_df,
+            x="Goal_date",
+            y="Criteria",
+            color="Compliance_status",
+            color_discrete_map={"Partial": "#F5C542", "Not compliant": "#E74C3C", "Blank": "#95A5A6"},
+            title=f"{dept_timeline} – Goal Dates (open items only)",
+            labels={"Goal_date": "Target date"}
+        )
+        fig_timeline.update_traces(marker=dict(size=12))
+        fig_timeline.update_layout(yaxis=dict(categoryorder="array", categoryarray=criteria_order))
+        st.plotly_chart(fig_timeline, use_container_width=True)
+
+        st.subheader("Days from now to each goal date (negative = overdue)")
+        fig_days = px.bar(
+            timeline_df,
+            x="Days_from_now",
+            y="Criteria",
+            orientation="h",
+            color="Compliance_status",
+            color_discrete_map={"Partial": "#F5C542", "Not compliant": "#E74C3C", "Blank": "#95A5A6"},
+            title=f"{dept_timeline} – Days Remaining (open items only)",
+            labels={"Days_from_now": "Days from now"}
+        )
+        fig_days.update_layout(yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=criteria_order))
+        fig_days.add_vline(x=0, line_width=2, line_dash="dash")
+        st.plotly_chart(fig_days, use_container_width=True)
+
+# ======================================================
+# Radar (kept)
+# ======================================================
+with tab_radar:
+    st.subheader("Criteria compliance radar")
+
+    dept_radar = st.selectbox(
+        "Select department for radar",
+        sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
+        key="radar_dept"
+    )
+
+    radar_df = df_long[df_long["Department"] == dept_radar].copy()
+    if radar_df.empty:
+        st.info("No data for this department.")
+    else:
+        radar_df = radar_df.sort_values("Criteria")
+        fig_radar = px.line_polar(
+            radar_df,
+            r="Score",
+            theta="Criteria",
+            line_close=True,
+            range_r=[0, 1],
+            title=f"{dept_radar} – Compliance by Criteria"
+        )
+        fig_radar.update_traces(fill="toself")
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    tickvals=[0, 0.5, 1],
+                    ticktext=["Not compliant", "Partial", "Compliant"],
+                    visible=True
+                )
+            )
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+# ======================================================
+# Cross-department goals (kept)
+# ======================================================
+with tab_cross:
+    st.subheader("Cross-department goals timeline (select departments)")
+
+    dept_plot = st.multiselect(
+        "Choose departments to plot",
+        options=all_depts,
+        default=dept_sel
+    )
+    only_open = st.checkbox("Show only open items (Partial / Not compliant)", value=True)
+
+    cross = df_long[df_long["Department"].isin(dept_plot)].copy()
+    cross = cross[cross["Has_goal_date"]]
+    if only_open:
+        cross = cross[cross["Is_open_item"]]
+
+    if cross.empty:
+        st.info("No dated goals match your selection.")
+    else:
+        cross = cross.sort_values(["Criteria", "Goal_date"])
+
+        fig_cross = px.scatter(
+            cross,
+            x="Goal_date",
+            y="Criteria",
+            color="Department",
+            symbol="Compliance_status",
+            title="Goals Timeline: X = Goal Date, Y = Criteria, Color = Department",
+            labels={"Goal_date": "Goal date"}
+        )
+        fig_cross.update_traces(marker=dict(size=10))
+        fig_cross.update_layout(yaxis=dict(categoryorder="array", categoryarray=criteria_order))
+        st.plotly_chart(fig_cross, use_container_width=True)
+
+        with st.expander("See underlying rows used in this chart"):
+            st.dataframe(
+                cross[["Department", "Criteria", "Compliance_status", "Goal_raw", "Goal_date"]]
+                .sort_values(["Department", "Goal_date", "Criteria"]),
+                use_container_width=True
+            )
+
+# ======================================================
+# Clustered heatmap (NEW)
 # ======================================================
 with tab_cluster:
-    st.subheader("Clustered Heatmap (Department Similarity)")
+    st.subheader("Clustered heatmap (departments grouped by similarity)")
 
-    base = df_long.pivot_table(
-        index="Department",
-        columns="Criteria",
-        values="Score",
-        aggfunc="mean"
-    ).fillna(0)
+    if not SCIPY_OK:
+        st.error("SciPy is not installed. Add `scipy` to requirements.txt to enable clustering.")
+    else:
+        base = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="mean").fillna(0)
+        base = base.reindex(columns=criteria_order)
 
-    # Hierarchical clustering on departments
-    linkage_matrix = linkage(base.values, method="ward")
-    order = leaves_list(linkage_matrix)
+        if base.shape[0] < 2:
+            st.info("Need at least 2 departments in the filter selection to compute clusters.")
+        else:
+            # Cluster departments by similarity in compliance patterns
+            Z = linkage(base.values, method="ward")
+            order = leaves_list(Z)
+            clustered = base.iloc[order]
 
-    clustered = base.iloc[order]
-    clustered = clustered.reindex(columns=criteria_order)
+            fig_cluster = px.imshow(
+                clustered,
+                aspect="auto",
+                title="Clustered compliance heatmap (similar departments are adjacent)"
+            )
+            fig_cluster.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(fig_cluster, use_container_width=True)
 
-    fig_cluster = px.imshow(
-        clustered,
-        aspect="auto",
-        title="Clustered Compliance Heatmap (Similar departments grouped)"
-    )
-    fig_cluster.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(fig_cluster, use_container_width=True)
-
-    st.markdown(
-        """
-**How to read this:**
-- Departments close together have similar compliance patterns.
-- Use this to design **shared remediation actions**.
-        """
-    )
+            st.caption(
+                "Tip: Use this to design shared remediation plans for departments that fail the same criteria."
+            )
