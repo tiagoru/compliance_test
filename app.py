@@ -75,8 +75,11 @@ def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-def to_long(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert 2-header wide format into long format: Department, Criteria, Compliance_raw, Goal_raw."""
+def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Convert 2-header wide format into long format AND return the criteria order as it appears in the sheet.
+    Output columns: Department, Criteria, Compliance_raw, Goal_raw
+    """
     # Find criteria column (it might be ('Criteria','') or similar)
     criteria_col = None
     for col in df.columns:
@@ -88,13 +91,22 @@ def to_long(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
 
     criteria_series = df[criteria_col].rename("Criteria")
+    # Keep the criteria order exactly as in the sheet (first occurrence order)
+    criteria_order = (
+        criteria_series.dropna()
+        .astype(str).str.strip()
+        .loc[lambda s: (s != "") & (s.str.lower() != "nan")]
+        .drop_duplicates()
+        .tolist()
+    )
+
     rest = df.drop(columns=[criteria_col])
 
     # Stack departments into rows; the second header level becomes regular columns
     stacked = rest.stack(level=0).reset_index()  # columns: level_0, Department, <fields...>
     stacked = stacked.rename(columns={"level_1": "Department"})
 
-    # Detect the compliance & goal columns from the (former) second header row
+    # Detect compliance & goal columns from the second header row
     lower_map = {c: str(c).lower() for c in stacked.columns}
     compliance_col = next((c for c, v in lower_map.items() if "compliant" in v), None)
     goal_col = next((c for c, v in lower_map.items() if "goal" in v), None)
@@ -112,11 +124,11 @@ def to_long(df: pd.DataFrame) -> pd.DataFrame:
         "Goal_raw": stacked[goal_col].values,
     })
 
-    # Drop rows where Criteria is blank (sometimes extra empty rows appear)
+    # Drop blank criteria rows
     out["Criteria"] = out["Criteria"].astype(str).str.strip()
-    out = out[out["Criteria"].ne("") & out["Criteria"].ne("nan")]
+    out = out[out["Criteria"].ne("") & (out["Criteria"].str.lower() != "nan")]
 
-    return out
+    return out, criteria_order
 
 
 # ----------------------------
@@ -126,7 +138,6 @@ if not uploaded:
     st.info("Upload an Excel file to begin.")
     st.stop()
 
-# Read Excel
 xls = pd.ExcelFile(uploaded)
 sheet = st.selectbox("Select sheet", xls.sheet_names)
 
@@ -135,14 +146,16 @@ df_wide = read_excel_two_header(uploaded, sheet)
 st.subheader("Preview (as uploaded)")
 st.dataframe(df_wide.head(15), use_container_width=True)
 
-# Convert to long + normalize
 try:
-    df_long = to_long(df_wide)
+    df_long, criteria_order = to_long_with_order(df_wide)
 except Exception as e:
     st.error(f"Failed to reshape your Excel file: {e}")
     st.stop()
 
 df_long = normalize_values(df_long)
+
+# Enforce criteria order everywhere (heatmap, timeline y-axis, radar)
+df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -159,8 +172,8 @@ status_sel = st.sidebar.multiselect(
 dff = df_long[df_long["Department"].isin(dept_sel)]
 dff = dff[dff["Compliance_status"].isin(status_sel)]
 
-# Tabs
 tab1, tab2, tab3 = st.tabs(["Overview", "Timelines", "Radar"])
+
 
 # ----------------------------
 # Overview tab
@@ -176,7 +189,11 @@ with tab1:
     c4.metric("Missing goals", int((dff["Goal_status"] == "Missing").sum()))
 
     st.subheader("Department × Criteria heatmap (score)")
+
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
+
+    # Force the heatmap columns to follow the original criteria order
+    pivot = pivot.reindex(columns=criteria_order)
 
     if pivot.empty:
         st.info("No data to display (check filters).")
@@ -200,6 +217,7 @@ with tab1:
             use_container_width=True
         )
 
+
 # ----------------------------
 # Timelines tab
 # ----------------------------
@@ -221,24 +239,56 @@ with tab2:
     if timeline_df.empty:
         st.info("No dated goals for this department (or all items are compliant).")
     else:
-        timeline_df = timeline_df.sort_values("Goal_date")
+        # "Days from now" bar
+        today = pd.Timestamp.now(tz="Europe/Berlin").normalize().tz_localize(None)
+        timeline_df["Days_from_now"] = (timeline_df["Goal_date"] - today).dt.days
 
+        # Sort by goal date (and keep criteria order via categorical)
+        timeline_df = timeline_df.sort_values(["Goal_date", "Criteria"])
+
+        # 1) Timeline scatter
         fig_timeline = px.scatter(
             timeline_df,
             x="Goal_date",
             y="Criteria",
             color="Compliance_status",
             color_discrete_map={
-                "Partial": "#F5C542",        # amber
-                "Not compliant": "#E74C3C",  # red
-                "Blank": "#95A5A6"           # grey (if it appears)
+                "Partial": "#F5C542",
+                "Not compliant": "#E74C3C",
+                "Blank": "#95A5A6"
             },
-            title=f"{dept_timeline} – Goal Timeline",
+            title=f"{dept_timeline} – Goal Dates",
             labels={"Goal_date": "Target date"}
         )
         fig_timeline.update_traces(marker=dict(size=12))
-        fig_timeline.update_layout(yaxis=dict(autorange="reversed"))
+        fig_timeline.update_layout(yaxis=dict(categoryorder="array", categoryarray=criteria_order))
         st.plotly_chart(fig_timeline, use_container_width=True)
+
+        # 2) Days-from-now bar chart
+        st.subheader("Days from now to each goal date (negative = overdue)")
+
+        fig_days = px.bar(
+            timeline_df,
+            x="Days_from_now",
+            y="Criteria",
+            orientation="h",
+            color="Compliance_status",
+            color_discrete_map={
+                "Partial": "#F5C542",
+                "Not compliant": "#E74C3C",
+                "Blank": "#95A5A6"
+            },
+            title=f"{dept_timeline} – Days Remaining",
+            labels={"Days_from_now": "Days from now"}
+        )
+        # Put earliest goals at top
+        fig_days.update_layout(
+            yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=criteria_order)
+        )
+        # Add a vertical line at 0 (today)
+        fig_days.add_vline(x=0, line_width=2, line_dash="dash")
+        st.plotly_chart(fig_days, use_container_width=True)
+
 
 # ----------------------------
 # Radar tab
@@ -257,6 +307,7 @@ with tab3:
     if radar_df.empty:
         st.info("No data for this department.")
     else:
+        # Ensure radar follows the original criteria order
         radar_df = radar_df.sort_values("Criteria")
 
         fig_radar = px.line_polar(
@@ -265,7 +316,7 @@ with tab3:
             theta="Criteria",
             line_close=True,
             range_r=[0, 1],
-            title=f"{dept_radar} – Compliance by Criteria"
+            title=f"{dept_radar} – Compliance by Criteria (ordered)"
         )
         fig_radar.update_traces(fill="toself")
         fig_radar.update_layout(
