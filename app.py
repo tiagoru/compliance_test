@@ -1,4 +1,3 @@
-import re
 import pandas as pd
 import streamlit as st
 
@@ -7,37 +6,11 @@ st.title("Compliance Dashboard")
 
 uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
-def detect_pair_type(col_name: str):
-    """Return 'compliance' or 'goal' based on column name, else None."""
-    c = col_name.lower()
-    if "compliance" in c or "compliant" in c:
-        return "compliance"
-    if "goal" in c:
-        return "goal"
-    return None
-
-def extract_department(col_name: str):
-    """
-    Remove keywords like compliance/goal and separators to get department name.
-    Example: 'Dept A - Compliance' -> 'Dept A'
-    """
-    # remove bracket contents & trim
-    s = re.sub(r"\(.*?\)", "", col_name).strip()
-
-    # remove the type words
-    s = re.sub(r"(?i)\b(compliance|compliant\??|goal)\b", "", s).strip()
-
-    # cleanup common separators
-    s = re.sub(r"[-|:_]+", " ", s).strip()
-    s = re.sub(r"\s{2,}", " ", s).strip()
-
-    return s
 
 def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     """Standardize compliance/goal values and compute a score for KPIs/heatmaps."""
     df = df_long.copy()
 
-    # Normalize compliance values
     def norm_compliance(x):
         x = "" if pd.isna(x) else str(x).strip()
         xl = x.lower()
@@ -49,9 +22,8 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
             return "Partial"
         if x == "":
             return "Blank"
-        return x  # keep original text if it's something else
+        return x
 
-    # Normalize goal values
     def norm_goal(x):
         x = "" if pd.isna(x) else str(x).strip()
         if x.upper() == "MISSING":
@@ -66,65 +38,116 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     # Optional: parse goal date if present (dd.mm.yyyy)
     df["Goal_date"] = pd.to_datetime(df["Goal_raw"], format="%d.%m.%Y", errors="coerce")
 
-    # Score: Compliant=1, Partial=0.5, Not compliant/Blank=0
+    # Score: Compliant=1, Partial=0.5, else 0
     score_map = {"Compliant": 1.0, "Partial": 0.5}
     df["Score"] = df["Compliance_status"].map(score_map).fillna(0.0)
 
     return df
 
+
+def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
+    """
+    Reads your Excel where:
+    - Row 1 has Department labels repeated: A A B B C C ...
+    - Row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
+    """
+    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
+
+    # Forward-fill department names (merged cells often create blanks)
+    tuples = []
+    last_dept = None
+    for dept, field in df.columns:
+        dept = "" if pd.isna(dept) else str(dept).strip()
+        field = "" if pd.isna(field) else str(field).strip()
+
+        if dept:
+            last_dept = dept
+        else:
+            dept = last_dept
+
+        tuples.append((dept, field))
+
+    df.columns = pd.MultiIndex.from_tuples(tuples)
+    return df
+
+
+def to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert 2-header wide format into long format: Department, Criteria, Compliance_raw, Goal_raw."""
+    # Find criteria column (it might be ('Criteria','') or similar)
+    criteria_col = None
+    for col in df.columns:
+        if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
+            criteria_col = col
+            break
+
+    if criteria_col is None:
+        raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
+
+    criteria_series = df[criteria_col].rename("Criteria")
+    rest = df.drop(columns=[criteria_col])
+
+    # Stack departments into rows; the second header level becomes regular columns
+    stacked = rest.stack(level=0).reset_index()  # columns: level_0, Department, <fields...>
+    stacked = stacked.rename(columns={"level_1": "Department"})
+
+    # Detect the compliance & goal columns from the (former) second header row
+    lower_map = {c: str(c).lower() for c in stacked.columns}
+    compliance_col = next((c for c, v in lower_map.items() if "compliant" in v), None)
+    goal_col = next((c for c, v in lower_map.items() if "goal" in v), None)
+
+    if compliance_col is None or goal_col is None:
+        raise ValueError(
+            "Couldn't detect 'Compliant' and 'Goal' columns in the second header row. "
+            "Ensure the second header row contains words like 'Compliant?' and 'Goal'."
+        )
+
+    out = pd.DataFrame({
+        "Department": stacked["Department"],
+        "Criteria": criteria_series.loc[stacked["level_0"]].values,
+        "Compliance_raw": stacked[compliance_col].values,
+        "Goal_raw": stacked[goal_col].values,
+    })
+
+    # Drop rows where Criteria is blank (sometimes extra empty rows appear)
+    out["Criteria"] = out["Criteria"].astype(str).str.strip()
+    out = out[out["Criteria"].ne("") & out["Criteria"].ne("nan")]
+
+    return out
+
+
 if uploaded:
     # Read Excel
     xls = pd.ExcelFile(uploaded)
     sheet = st.selectbox("Select sheet", xls.sheet_names)
-    df_wide = pd.read_excel(uploaded, sheet_name=sheet)
+
+    # IMPORTANT CHANGE: read with two header rows
+    df_wide = read_excel_two_header(uploaded, sheet)
 
     st.subheader("Preview (as uploaded)")
     st.dataframe(df_wide.head(15), use_container_width=True)
 
-    # Identify criteria column (assume first col)
-    criteria_col = df_wide.columns[0]
-    other_cols = list(df_wide.columns[1:])
-
-    # Build a mapping: dept -> {'compliance': col, 'goal': col}
-    pairs = {}
-    for col in other_cols:
-        t = detect_pair_type(str(col))
-        if not t:
-            continue
-        dept = extract_department(str(col))
-        pairs.setdefault(dept, {})[t] = col
-
-    # Keep only departments that have BOTH columns
-    valid_depts = [d for d, p in pairs.items() if "compliance" in p and "goal" in p]
-
-    if not valid_depts:
-        st.error(
-            "I couldn't detect department column pairs.\n\n"
-            "Make sure each department has two columns whose headers include words like "
-            "'Compliance/Compliant' and 'Goal'."
-        )
+    # Convert to long + normalize
+    try:
+        df_long = to_long(df_wide)
+    except Exception as e:
+        st.error(f"Failed to reshape your Excel file: {e}")
         st.stop()
 
-    # Convert wide -> long
-    rows = []
-    for dept in valid_depts:
-        c_col = pairs[dept]["compliance"]
-        g_col = pairs[dept]["goal"]
-        tmp = df_wide[[criteria_col, c_col, g_col]].copy()
-        tmp.columns = ["Criteria", "Compliance_raw", "Goal_raw"]
-        tmp["Department"] = dept
-        rows.append(tmp)
-
-    df_long = pd.concat(rows, ignore_index=True)
     df_long = normalize_values(df_long)
 
     # Sidebar filters
     st.sidebar.header("Filters")
-    dept_sel = st.sidebar.multiselect("Department", sorted(df_long["Department"].unique()),
-                                      default=sorted(df_long["Department"].unique()))
-    status_sel = st.sidebar.multiselect("Compliance status",
-                                        ["Compliant", "Partial", "Not compliant", "Blank"],
-                                        default=["Compliant", "Partial", "Not compliant"])
+    dept_sel = st.sidebar.multiselect(
+        "Department",
+        sorted(df_long["Department"].dropna().unique()),
+        default=sorted(df_long["Department"].dropna().unique())
+    )
+    status_sel = st.sidebar.multiselect(
+        "Compliance status",
+        ["Compliant", "Partial", "Not compliant", "Blank"],
+        default=["Compliant", "Partial", "Not compliant"]
+    )
+
     dff = df_long[df_long["Department"].isin(dept_sel)]
     dff = dff[dff["Compliance_status"].isin(status_sel)]
 
@@ -137,7 +160,7 @@ if uploaded:
     c3.metric("Partial", int((dff["Compliance_status"] == "Partial").sum()))
     c4.metric("Missing goals", int((dff["Goal_status"] == "Missing").sum()))
 
-    # Heatmap matrix (simple version using a pivot + st.dataframe coloring)
+    # Heatmap matrix (pivot + background gradient)
     st.subheader("Department × Criteria matrix (score)")
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
 
@@ -151,7 +174,10 @@ if uploaded:
     missing = dff[dff["Goal_status"] == "Missing"][["Department", "Criteria", "Compliance_status", "Goal_status"]]
     st.dataframe(missing, use_container_width=True)
 
-    # Show normalized long table (debug/validation)
+    # Debug table
     with st.expander("See normalized (long) table"):
-        st.dataframe(dff[["Department","Criteria","Compliance_raw","Goal_raw","Compliance_status","Goal_status","Goal_date","Score"]],
-                     use_container_width=True)
+        st.dataframe(
+            dff[["Department", "Criteria", "Compliance_raw", "Goal_raw",
+                 "Compliance_status", "Goal_status", "Goal_date", "Score"]],
+            use_container_width=True
+        )
