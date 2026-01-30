@@ -1,3 +1,4 @@
+import re
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -32,7 +33,7 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
             return "Partial"
         if x == "":
             return "Blank"
-        return x
+        return x  # keep unexpected text
 
     def norm_goal(x):
         x = "" if pd.isna(x) else str(x).strip()
@@ -60,8 +61,8 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
 def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
     """
     Reads Excel where:
-    - Header row 1 has Department labels repeated: A A B B C C ...
-    - Header row 2 has field names repeated: Compliant? Goal Compliant? Goal ...
+    - Header row 1 has Department labels repeated
+    - Header row 2 has field names repeated: Compliant? Goal
     """
     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
 
@@ -122,7 +123,6 @@ def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     out["Criteria"] = out["Criteria"].astype(str).str.strip()
     out = out[out["Criteria"].ne("") & (out["Criteria"].str.lower() != "nan")]
-
     return out, criteria_order
 
 
@@ -155,12 +155,11 @@ def dept_leaderboard(df_in: pd.DataFrame, today: pd.Timestamp, d30: pd.Timestamp
         return float((sub["Goal_date"] - today).dt.days.mean())
 
     out["Avg_days_to_goal_open"] = out["Department"].apply(avg_days_open).round(1)
-
     return out.sort_values(["Overdue", "Compliance_pct"], ascending=[False, True])
 
 
 # ======================================================
-# Visualization helper (FIXED widget keys)
+# Visualization helper (unique keys)
 # ======================================================
 def draw_heatmap_with_controls(
     data: pd.DataFrame,
@@ -170,23 +169,14 @@ def draw_heatmap_with_controls(
     show_chunking: bool = True,
     default_chunk: int = 12,
 ):
-    """
-    Heatmap with:
-    - zoom slider (px per column)
-    - optional chunking across criteria
-    - bigger height, rotated labels
-    - ALL widgets have unique keys via key_prefix (fixes duplicate ID errors)
-    """
     if data.empty:
         st.info("No data to display (check filters).")
         return
 
-    # enforce criteria order for columns that exist
     crit_cols = [c for c in criteria_order if c in data.columns]
     other_cols = [c for c in data.columns if c not in crit_cols]
     data = data[crit_cols + other_cols]
 
-    # Optional chunking (only across criteria columns, not extra columns)
     view = data
     if show_chunking and len(crit_cols) > default_chunk:
         chunk = st.select_slider(
@@ -227,8 +217,85 @@ def draw_heatmap_with_controls(
     )
     fig.update_xaxes(tickangle=45, tickfont=dict(size=10))
     fig.update_yaxes(tickfont=dict(size=11))
-
     st.plotly_chart(fig, use_container_width=False)
+
+
+# ======================================================
+# NEW: Planner sheet parsing
+# ======================================================
+def flatten_planner_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Accepts planner data with either:
+    - MultiIndex columns: (2026, Q1) (2026, Q2) ...
+    - Single-line columns: "2026 Q1", "2026-Q1", etc.
+    Returns df with flattened columns like "2026-Q1".
+    """
+    out = df.copy()
+
+    if isinstance(out.columns, pd.MultiIndex):
+        cols = []
+        for a, b in out.columns:
+            a = "" if pd.isna(a) else str(a).strip()
+            b = "" if pd.isna(b) else str(b).strip()
+            if a == "" and b == "":
+                cols.append("")
+            elif b == "":
+                cols.append(a)
+            else:
+                cols.append(f"{a}-{b}")
+        out.columns = cols
+    else:
+        new_cols = []
+        for c in out.columns:
+            s = "" if pd.isna(c) else str(c).strip()
+            # normalize "2026 Q1" -> "2026-Q1"
+            m = re.match(r"^\s*(20\d{2})\s*[- ]?\s*(Q[1-4])\s*$", s, flags=re.I)
+            if m:
+                new_cols.append(f"{m.group(1)}-{m.group(2).upper()}")
+            else:
+                new_cols.append(s)
+        out.columns = new_cols
+
+    return out
+
+
+def detect_department_column(df: pd.DataFrame) -> str | None:
+    """
+    Try to detect a department column (common names).
+    """
+    candidates = ["department", "dept", "unit", "name"]
+    for c in df.columns:
+        if any(k in str(c).lower() for k in candidates):
+            return c
+    # fallback: first column
+    if len(df.columns) > 0:
+        return df.columns[0]
+    return None
+
+
+def planner_to_long(df_planner: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert planner wide table to long:
+    Department | Period (YYYY-Qn) | Value
+    """
+    dept_col = detect_department_column(df_planner)
+    if dept_col is None:
+        raise ValueError("Could not find a department column in planner table.")
+
+    # identify period columns like 2026-Q1
+    period_cols = [c for c in df_planner.columns if re.match(r"^20\d{2}-Q[1-4]$", str(c))]
+    if not period_cols:
+        raise ValueError("No planner period columns found (expected columns like 2026-Q1, 2026-Q2...).")
+
+    long = df_planner.melt(
+        id_vars=[dept_col],
+        value_vars=period_cols,
+        var_name="Period",
+        value_name="Count"
+    )
+    long = long.rename(columns={dept_col: "Department"})
+    long["Count"] = pd.to_numeric(long["Count"], errors="coerce").fillna(0).astype(int)
+    return long
 
 
 # ======================================================
@@ -239,7 +306,7 @@ if not uploaded:
     st.stop()
 
 xls = pd.ExcelFile(uploaded)
-sheet = st.selectbox("Select sheet", xls.sheet_names)
+sheet = st.selectbox("Select compliance sheet", xls.sheet_names, key="main_sheet")
 
 df_wide = read_excel_two_header(uploaded, sheet)
 st.subheader("Preview (as uploaded)")
@@ -262,21 +329,22 @@ d90 = today + pd.Timedelta(days=90)
 # Sidebar filters
 st.sidebar.header("Filters")
 all_depts = sorted(df_long["Department"].dropna().unique())
-dept_sel = st.sidebar.multiselect("Department", all_depts, default=all_depts)
+dept_sel = st.sidebar.multiselect("Department", all_depts, default=all_depts, key="flt_depts")
 
 status_options = ["Compliant", "Partial", "Not compliant", "Blank"]
 status_sel = st.sidebar.multiselect(
     "Compliance status",
     status_options,
-    default=["Compliant", "Partial", "Not compliant"]
+    default=["Compliant", "Partial", "Not compliant"],
+    key="flt_status"
 )
 
 dff = df_long[df_long["Department"].isin(dept_sel)]
 dff = dff[dff["Compliance_status"].isin(status_sel)]
 
-# Tabs
-tab_exec, tab_overview, tab_timelines, tab_radar, tab_cross, tab_cluster = st.tabs(
-    ["Executive Summary", "Overview", "Timelines", "Radar", "Cross-department Goals", "Clustered Heatmap"]
+# Tabs (existing + new)
+tab_exec, tab_overview, tab_timelines, tab_radar, tab_cross, tab_cluster, tab_counts_planner = st.tabs(
+    ["Executive Summary", "Overview", "Timelines", "Radar", "Cross-department Goals", "Clustered Heatmap", "Counts & Planner"]
 )
 
 # ======================================================
@@ -306,28 +374,14 @@ with tab_exec:
     st.markdown(
         f"""
 - **As of {today.date()}**, overall compliance is **{overall:.1f}%** across the selected departments.
-- There are **{int(open_items.shape[0])} open items**, with **{int(overdue.shape[0])} overdue**.
-- **{int(due_30.shape[0])} items are due within 30 days**.
+- **{int(open_items.shape[0])} open items**, **{int(overdue.shape[0])} overdue**, **{int(due_30.shape[0])} due in 30 days**.
 - Weakest criteria: **{", ".join(weakest_criteria[:3]) if weakest_criteria else "—"}**
-- Departments needing attention: **{", ".join(weakest_depts[:3]) if weakest_depts else "—"}**
+- Lowest-performing departments: **{", ".join(weakest_depts[:3]) if weakest_depts else "—"}**
         """
     )
 
-    st.markdown("### Top urgent items (overdue first)")
-    urgent = open_items[open_items["Has_goal_date"]].copy()
-    urgent["Days_from_now"] = (urgent["Goal_date"] - today).dt.days
-    urgent = urgent.sort_values(["Days_from_now", "Department", "Criteria"]).head(10)
-
-    if urgent.empty:
-        st.info("No dated goals for open items in the current selection.")
-    else:
-        st.dataframe(
-            urgent[["Department", "Criteria", "Compliance_status", "Goal_date", "Days_from_now"]],
-            use_container_width=True
-        )
-
 # ======================================================
-# Overview (heatmap + leaderboard + density + action lists)
+# Overview
 # ======================================================
 with tab_overview:
     st.subheader("Overview")
@@ -345,7 +399,6 @@ with tab_overview:
     c5.metric("Missing goals", int(dff[dff["Has_missing_goal"]].shape[0]))
 
     st.subheader("Compliance heatmap (wide + zoom + chunking)")
-
     pivot = dff.pivot_table(index="Department", columns="Criteria", values="Score", aggfunc="max").fillna(0)
     pivot = pivot.reindex(columns=criteria_order)
 
@@ -366,7 +419,6 @@ with tab_overview:
 
         pivot2 = pivot.copy()
         pivot2["Dept Avg"] = pivot2.mean(axis=1)
-
         crit_avg = pivot2.drop(columns=["Dept Avg"]).mean(axis=0)
         crit_avg["Dept Avg"] = pivot2["Dept Avg"].mean()
         pivot2.loc["Criteria Avg"] = crit_avg
@@ -442,11 +494,10 @@ with tab_overview:
         )
 
 # ======================================================
-# Timelines (single dept)
+# Timelines
 # ======================================================
 with tab_timelines:
     st.subheader("Goals timeline (single department)")
-
     dept_timeline = st.selectbox(
         "Select department for timeline",
         sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
@@ -496,7 +547,6 @@ with tab_timelines:
 # ======================================================
 with tab_radar:
     st.subheader("Criteria compliance radar")
-
     dept_radar = st.selectbox(
         "Select department for radar",
         sorted(dff["Department"].dropna().unique()) if not dff.empty else all_depts,
@@ -520,17 +570,11 @@ with tab_radar:
         st.plotly_chart(fig_radar, use_container_width=True)
 
 # ======================================================
-# Cross-department goals
+# Cross-department Goals
 # ======================================================
 with tab_cross:
     st.subheader("Cross-department goals timeline (select departments)")
-
-    dept_plot = st.multiselect(
-        "Choose departments to plot",
-        options=all_depts,
-        default=dept_sel,
-        key="cross_depts"
-    )
+    dept_plot = st.multiselect("Choose departments to plot", options=all_depts, default=dept_sel, key="cross_depts")
     only_open = st.checkbox("Show only open items (Partial / Not compliant)", value=True, key="cross_only_open")
 
     cross = df_long[df_long["Department"].isin(dept_plot)].copy()
@@ -556,7 +600,7 @@ with tab_cross:
         st.plotly_chart(fig_cross, use_container_width=True)
 
 # ======================================================
-# Clustered heatmap (FIXED duplicate widget IDs)
+# Clustered Heatmap
 # ======================================================
 with tab_cluster:
     st.subheader("Clustered heatmap (departments grouped by similarity)")
@@ -578,7 +622,144 @@ with tab_cluster:
                 clustered,
                 title="Clustered compliance heatmap (similar departments are adjacent)",
                 criteria_order=criteria_order,
-                key_prefix="cluster_heat"   # <-- unique keys here
+                key_prefix="cluster_heat"
             )
 
-            st.caption("Departments close together have similar compliance patterns.")
+# ======================================================
+# NEW TAB: Counts & Planner
+# ======================================================
+with tab_counts_planner:
+    st.subheader("Counts & Planner")
+
+    subtab_counts, subtab_planner = st.tabs(["Status counts", "Quarter planner"])
+
+    # --------------------------
+    # Status counts (from df_long)
+    # --------------------------
+    with subtab_counts:
+        st.markdown("### Status counts per department")
+
+        # Use RAW compliance text (Yes / No / Partial - goal approved / Partial - goal under review)
+        def simplify_raw(x):
+            x = "" if pd.isna(x) else str(x).strip()
+            if x.lower() == "yes":
+                return "Yes"
+            if x.lower() == "no":
+                return "No"
+            if "partial - goal approved" in x.lower():
+                return "Partial - goal approved"
+            if "partial - goal under review" in x.lower():
+                return "Partial - goal under review"
+            if "partial" in x.lower():
+                return "Partial"
+            if x == "":
+                return "Blank"
+            return x
+
+        tmp = df_long[df_long["Department"].isin(dept_sel)].copy()
+        tmp["Raw_bucket"] = tmp["Compliance_raw"].apply(simplify_raw)
+
+        order_buckets = ["Yes", "Partial - goal approved", "Partial - goal under review", "Partial", "No", "Blank"]
+        counts = (
+            tmp.groupby(["Department", "Raw_bucket"], as_index=False)
+            .size()
+            .rename(columns={"size": "Count"})
+        )
+
+        # Pivot table
+        counts_pivot = counts.pivot_table(index="Department", columns="Raw_bucket", values="Count", aggfunc="sum").fillna(0).astype(int)
+        # enforce column order where possible
+        cols = [c for c in order_buckets if c in counts_pivot.columns] + [c for c in counts_pivot.columns if c not in order_buckets]
+        counts_pivot = counts_pivot[cols]
+
+        st.dataframe(counts_pivot, use_container_width=True)
+
+        # Stacked bar chart
+        st.markdown("### Visual: stacked counts")
+        counts_plot = counts.copy()
+        counts_plot["Raw_bucket"] = pd.Categorical(counts_plot["Raw_bucket"], categories=order_buckets, ordered=True)
+        counts_plot = counts_plot.sort_values(["Department", "Raw_bucket"])
+
+        fig_counts = px.bar(
+            counts_plot,
+            x="Department",
+            y="Count",
+            color="Raw_bucket",
+            barmode="stack",
+            title="Compliance raw status counts per department"
+        )
+        st.plotly_chart(fig_counts, use_container_width=True)
+
+    # --------------------------
+    # Quarter planner (from optional planner sheet/table)
+    # --------------------------
+    with subtab_planner:
+        st.markdown("### Quarter planner (2026–2029)")
+
+        st.caption(
+            "This reads a planner table from your Excel. "
+            "It supports either a multi-header (Year / Quarter) or flat headers like '2026 Q1'."
+        )
+
+        planner_sheet = st.selectbox(
+            "Select planner sheet (if applicable)",
+            options=xls.sheet_names,
+            index=0,
+            key="planner_sheet"
+        )
+
+        # Try reading planner sheet in a robust way:
+        # 1) Try 2-row header first
+        # 2) If it fails, fallback to 1-row header
+        try:
+            df_pl = pd.read_excel(uploaded, sheet_name=planner_sheet, header=[0, 1])
+            df_pl = flatten_planner_columns(df_pl)
+        except Exception:
+            df_pl = pd.read_excel(uploaded, sheet_name=planner_sheet, header=0)
+            df_pl = flatten_planner_columns(df_pl)
+
+        st.markdown("#### Planner sheet preview")
+        st.dataframe(df_pl.head(20), use_container_width=True)
+
+        try:
+            planner_long = planner_to_long(df_pl)
+        except Exception as e:
+            st.error(f"Could not parse planner table on this sheet: {e}")
+            st.stop()
+
+        # Filter to selected departments (if names match)
+        planner_long = planner_long[planner_long["Department"].isin(dept_sel)].copy()
+
+        if planner_long.empty:
+            st.info("Planner data loaded, but no rows match the selected departments (check department names).")
+        else:
+            # Keep period order by sorting year then quarter
+            def period_sort_key(p):
+                m = re.match(r"^(20\d{2})-Q([1-4])$", str(p))
+                if not m:
+                    return (9999, 9)
+                return (int(m.group(1)), int(m.group(2)))
+
+            period_order = sorted(planner_long["Period"].unique(), key=period_sort_key)
+            planner_long["Period"] = pd.Categorical(planner_long["Period"], categories=period_order, ordered=True)
+
+            # Heatmap Department x Period
+            st.markdown("#### Heatmap: Department × Quarter")
+            piv = planner_long.pivot_table(index="Department", columns="Period", values="Count", aggfunc="sum").fillna(0).astype(int)
+            fig_pl = px.imshow(piv, aspect="auto", title="Planner counts by quarter (per department)")
+            fig_pl.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(fig_pl, use_container_width=True)
+
+            # Department selector for a line/bar
+            st.markdown("#### Timeline per department")
+            dept_pick = st.selectbox("Department", sorted(planner_long["Department"].unique()), key="planner_dept_pick")
+            dept_series = planner_long[planner_long["Department"] == dept_pick].sort_values("Period")
+
+            fig_line = px.bar(
+                dept_series,
+                x="Period",
+                y="Count",
+                title=f"{dept_pick} – Quarterly plan",
+                labels={"Count": "Planned count"}
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
