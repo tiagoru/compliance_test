@@ -9,83 +9,8 @@ uploaded = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
 
 
 # ======================================================
-# Reading this Excel format
-# Format you showed:
-# Row 1:  Criteria | <Department Name merged across 2 cols> | <next dept>...
-# Row 2:  (blank)  | Compliant? | Goal | Compliant? | Goal ...
+# Helpers
 # ======================================================
-def read_excel_two_header(uploaded_file, sheet_name: str) -> pd.DataFrame:
-    df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=[0, 1])
-
-    # Forward-fill department names in level 0 for merged cells
-    tuples = []
-    last_dept = None
-    for dept, field in df.columns:
-        dept = "" if pd.isna(dept) else str(dept).strip()
-        field = "" if pd.isna(field) else str(field).strip()
-
-        if dept:
-            last_dept = dept
-        else:
-            dept = last_dept
-
-        tuples.append((dept, field))
-
-    df.columns = pd.MultiIndex.from_tuples(tuples)
-    return df
-
-
-def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    # Find criteria column (either level can contain "Criteria")
-    criteria_col = None
-    for col in df.columns:
-        if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
-            criteria_col = col
-            break
-    if criteria_col is None:
-        raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
-
-    criteria_series = df[criteria_col].rename("Criteria")
-
-    # Keep criteria order as shown in the file
-    criteria_order = (
-        criteria_series.dropna()
-        .astype(str).str.strip()
-        .loc[lambda s: (s != "") & (s.str.lower() != "nan")]
-        .drop_duplicates()
-        .tolist()
-    )
-
-    rest = df.drop(columns=[criteria_col])
-
-    # Stack department level (level=0 becomes rows)
-    stacked = rest.stack(level=0).reset_index()
-    # columns are: level_0 (row index), Department, <fields...>
-    stacked = stacked.rename(columns={"level_1": "Department"})
-
-    # Detect compliance + goal columns from the stacked columns
-    cols_lower = {c: str(c).lower() for c in stacked.columns}
-    compliance_col = next((c for c, v in cols_lower.items() if "compliant" in v), None)
-    goal_col = next((c for c, v in cols_lower.items() if "goal" in v), None)
-
-    if compliance_col is None or goal_col is None:
-        raise ValueError(
-            "Couldn't detect 'Compliant?' and 'Goal' columns. "
-            "Ensure the 2nd header row contains 'Compliant?' and 'Goal'."
-        )
-
-    out = pd.DataFrame({
-        "Department": stacked["Department"],
-        "Criteria": criteria_series.loc[stacked["level_0"]].values,
-        "Compliance_raw": stacked[compliance_col].values,
-        "Goal_raw": stacked[goal_col].values,
-    })
-
-    out["Criteria"] = out["Criteria"].astype(str).str.strip()
-    out = out[(out["Criteria"] != "") & (out["Criteria"].str.lower() != "nan")]
-    return out, criteria_order
-
-
 def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df = df_long.copy()
 
@@ -113,7 +38,7 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df["Compliance_status"] = df["Compliance_raw"].apply(norm_compliance)
     df["Goal_status"] = df["Goal_raw"].apply(norm_goal)
 
-    # Parse goal dates robustly: accepts 30/01/2026, 30.01.2026, 2026-01-30
+    # Robust date parsing (handles 30/01/2026, 30.01.2026, 2026-01-30)
     goal_str = df["Goal_raw"].astype(str).str.strip().str.replace(".", "/", regex=False)
     df["Goal_date"] = pd.to_datetime(goal_str, errors="coerce", dayfirst=True)
 
@@ -125,6 +50,62 @@ def normalize_values(df_long: pd.DataFrame) -> pd.DataFrame:
     df["Has_missing_goal"] = df["Goal_status"].eq("Missing")
 
     return df
+
+
+def to_long_with_order(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    df is expected to have MultiIndex columns:
+      level 0: 'Criteria', '<Department>', '<Department>', ...
+      level 1: '', 'Compliant?', 'Goal', ...
+    """
+    # Find criteria column
+    criteria_col = None
+    for col in df.columns:
+        if "criteria" in str(col[0]).lower() or "criteria" in str(col[1]).lower():
+            criteria_col = col
+            break
+    if criteria_col is None:
+        raise ValueError("Couldn't find the Criteria column. Make sure the header contains 'Criteria'.")
+
+    criteria_series = df[criteria_col].rename("Criteria")
+
+    # Keep criteria order as shown
+    criteria_order = (
+        criteria_series.dropna()
+        .astype(str).str.strip()
+        .loc[lambda s: (s != "") & (s.str.lower() != "nan")]
+        .drop_duplicates()
+        .tolist()
+    )
+
+    rest = df.drop(columns=[criteria_col])
+
+    # Stack departments (level=0 becomes rows)
+    stacked = rest.stack(level=0).reset_index()
+    # stacked columns include level_0 (original row index), Department, and second-level headers
+    stacked = stacked.rename(columns={"level_1": "Department"})
+
+    # detect "Compliant" and "Goal" columns in stacked output
+    cols_lower = {c: str(c).lower() for c in stacked.columns}
+    compliance_col = next((c for c, v in cols_lower.items() if "compliant" in v), None)
+    goal_col = next((c for c, v in cols_lower.items() if "goal" in v), None)
+
+    if compliance_col is None or goal_col is None:
+        raise ValueError(
+            "Couldn't detect 'Compliant?' and 'Goal' columns. "
+            "Ensure the second header row contains 'Compliant?' and 'Goal'."
+        )
+
+    out = pd.DataFrame({
+        "Department": stacked["Department"],
+        "Criteria": criteria_series.loc[stacked["level_0"]].values,
+        "Compliance_raw": stacked[compliance_col].values,
+        "Goal_raw": stacked[goal_col].values,
+    })
+
+    out["Criteria"] = out["Criteria"].astype(str).str.strip()
+    out = out[(out["Criteria"] != "") & (out["Criteria"].str.lower() != "nan")]
+    return out, criteria_order
 
 
 def heatmap_with_zoom(data: pd.DataFrame, title: str, key_prefix: str, criteria_order=None):
@@ -153,6 +134,35 @@ def heatmap_with_zoom(data: pd.DataFrame, title: str, key_prefix: str, criteria_
     st.plotly_chart(fig, use_container_width=False)
 
 
+def format_col_label(col_tuple):
+    a, b = col_tuple
+    a = "" if pd.isna(a) else str(a).strip()
+    b = "" if pd.isna(b) else str(b).strip()
+    return f"{a} | {b}" if b else f"{a}"
+
+
+def forward_fill_multiindex_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Forward-fill level-0 department names (handles merged header cells).
+    """
+    tuples = []
+    last_dept = None
+    for dept, field in df.columns:
+        dept = "" if pd.isna(dept) else str(dept).strip()
+        field = "" if pd.isna(field) else str(field).strip()
+
+        if dept:
+            last_dept = dept
+        else:
+            dept = last_dept
+
+        tuples.append((dept, field))
+
+    df2 = df.copy()
+    df2.columns = pd.MultiIndex.from_tuples(tuples)
+    return df2
+
+
 # ======================================================
 # App start
 # ======================================================
@@ -163,35 +173,100 @@ if not uploaded:
 xls = pd.ExcelFile(uploaded)
 sheet = st.selectbox("Select sheet", xls.sheet_names)
 
-df_wide = read_excel_two_header(uploaded, sheet)
-
-with st.expander("Preview (as uploaded)"):
-    st.dataframe(df_wide.head(20), use_container_width=True)
-
+# Read raw 2-header sheet first (we will let user choose columns in Tab 0)
 try:
-    df_long, criteria_order = to_long_with_order(df_wide)
+    df_raw = pd.read_excel(uploaded, sheet_name=sheet, header=[0, 1])
 except Exception as e:
-    st.error(f"Failed to reshape your Excel file: {e}")
+    st.error(f"Could not read the sheet with 2 header rows: {e}")
     st.stop()
 
-df_long = normalize_values(df_long)
-df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
-
-today = pd.Timestamp.now().normalize()
-departments = sorted(df_long["Department"].dropna().unique())
-
-# ======================================================
-# Tabs (Simple)
-# ======================================================
-tab1, tab2, tab3 = st.tabs(
-    ["1) Overview (All departments)", "2) Department view", "3) Problem areas"]
+# Tabs (Simple + setup tab)
+tab_setup, tab1, tab2, tab3 = st.tabs(
+    ["0) Data setup", "1) Overview (All departments)", "2) Department view", "3) Problem areas"]
 )
 
 # ======================================================
-# 1) Overview
+# 0) Data setup (choose columns)
+# ======================================================
+with tab_setup:
+    st.subheader("Data setup – choose which columns to use")
+
+    st.markdown(
+        """
+Your Excel may contain extra empty/unused columns.  
+Use this step to select the **Criteria column** and the **last column to include**.
+Everything after the last column will be ignored.
+        """
+    )
+
+    col_labels = [f"{i}: {format_col_label(c)}" for i, c in enumerate(df_raw.columns)]
+
+    criteria_idx = st.selectbox(
+        "Select Criteria column",
+        options=list(range(len(col_labels))),
+        format_func=lambda i: col_labels[i],
+        index=0,
+        key="setup_criteria_idx"
+    )
+
+    last_col_idx = st.selectbox(
+        "Select LAST column to include",
+        options=list(range(criteria_idx + 1, len(col_labels))),
+        format_func=lambda i: col_labels[i],
+        index=min(criteria_idx + 80, len(col_labels) - 1),
+        key="setup_last_col_idx"
+    )
+
+    df_limited = df_raw.iloc[:, criteria_idx:last_col_idx + 1].copy()
+    df_limited = forward_fill_multiindex_columns(df_limited)
+
+    st.markdown("### Preview of selected data")
+    st.dataframe(df_limited.head(20), use_container_width=True)
+
+    st.success(
+        f"Using columns {criteria_idx} → {last_col_idx} "
+        f"({last_col_idx - criteria_idx} data columns)."
+    )
+
+    st.caption("If the preview still shows junk columns, choose an earlier LAST column.")
+
+# ======================================================
+# Build df_long from the user-selected slice (used by tabs 1–3)
+# ======================================================
+try:
+    # Recreate same limited df using current widget state
+    criteria_idx_state = st.session_state.get("setup_criteria_idx", 0)
+    last_col_idx_state = st.session_state.get("setup_last_col_idx", min(80, len(df_raw.columns) - 1))
+
+    df_wide = df_raw.iloc[:, criteria_idx_state:last_col_idx_state + 1].copy()
+    df_wide = forward_fill_multiindex_columns(df_wide)
+
+    df_long, criteria_order = to_long_with_order(df_wide)
+    df_long = normalize_values(df_long)
+    df_long["Criteria"] = pd.Categorical(df_long["Criteria"], categories=criteria_order, ordered=True)
+
+    today = pd.Timestamp.now().normalize()
+    departments = sorted(df_long["Department"].dropna().unique())
+except Exception as e:
+    # If setup selection is wrong, show message in other tabs
+    df_long = pd.DataFrame()
+    criteria_order = []
+    departments = []
+    today = pd.Timestamp.now().normalize()
+
+    with tab1:
+        st.error(f"Data setup is not valid yet: {e}")
+        st.stop()
+
+# ======================================================
+# 1) Overview (All departments)
 # ======================================================
 with tab1:
     st.subheader("Overview (All Departments)")
+
+    if df_long.empty:
+        st.info("No data. Check Tab 0 (Data setup).")
+        st.stop()
 
     c1, c2, c3, c4 = st.columns(4)
     overall = df_long["Score"].mean() * 100 if len(df_long) else 0
@@ -230,6 +305,10 @@ with tab1:
 # ======================================================
 with tab2:
     st.subheader("Department view")
+
+    if df_long.empty:
+        st.info("No data. Check Tab 0 (Data setup).")
+        st.stop()
 
     dept = st.selectbox("Select department", departments, key="dept_select")
     d_dept = df_long[df_long["Department"] == dept].copy().sort_values("Criteria")
@@ -272,7 +351,6 @@ with tab2:
 
     st.markdown("### Timeline (open items with dates)")
     timeline_df = d_dept[d_dept["Is_open_item"] & d_dept["Has_goal_date"]].copy()
-
     if timeline_df.empty:
         st.info("No dated goals for open items in this department.")
     else:
@@ -315,6 +393,10 @@ with tab2:
 # ======================================================
 with tab3:
     st.subheader("Problem areas")
+
+    if df_long.empty:
+        st.info("No data. Check Tab 0 (Data setup).")
+        st.stop()
 
     st.markdown("### Most problematic criteria (across all departments)")
     crit_stats = (
@@ -387,7 +469,6 @@ with tab3:
             aggfunc="count"
         ).fillna(0).astype(int)
 
-        # Order by totals
         crit_order = prob_pivot.sum(axis=1).sort_values(ascending=False).index.tolist()
         dept_order = prob_pivot.sum(axis=0).sort_values(ascending=False).index.tolist()
         prob_pivot = prob_pivot.loc[crit_order, dept_order]
